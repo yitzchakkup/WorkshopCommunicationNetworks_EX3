@@ -10,7 +10,6 @@
 #include <endian.h> // For htobe64, be64toh
 #include <time.h>   // For time-related functions (though not directly used by print_data, it was requested)
 
-#define OOB_PORT 18515
 #define MAX_BUF_SIZE (1024 * 1024) // 1MB buffer for All-Reduce
 
 // --- Configuration Macros ---
@@ -295,7 +294,7 @@ int pg_close(void *pg_handle); // Forward declaration
 
 /* * 'servername' acts as the IP address of your right-hand neighbor.
  */
-int connect_process_group(char *servername, int my_rank, int num_nodes, void **pg_handle) {
+int connect_process_group(char *servername, int my_rank, int num_nodes, void **pg_handle, int oob_port) {
     struct pg_handle_t *handle = calloc(1, sizeof(struct pg_handle_t));
     if (!handle) {
         fprintf(stderr, "Error: Could not allocate memory for pg_handle_t\n");
@@ -415,23 +414,23 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
 
     // 3. Avoid Deadlocks using Rank (Even listens first, Odd connects first)
     if (my_rank % 2 == 0) {
-        if (exchange_with_left(handle, my_lid, my_psn, OOB_PORT) != 0) {
+        if (exchange_with_left(handle, my_lid, my_psn, oob_port) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with left neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
         }
-        if (exchange_with_right(handle, servername, my_lid, my_psn, OOB_PORT) != 0) {
+        if (exchange_with_right(handle, servername, my_lid, my_psn, oob_port) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with right neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
         }
     } else {
-        if (exchange_with_right(handle, servername, my_lid, my_psn, OOB_PORT) != 0) {
+        if (exchange_with_right(handle, servername, my_lid, my_psn, oob_port) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with right neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
         }
-        if (exchange_with_left(handle, my_lid, my_psn, OOB_PORT) != 0) {
+        if (exchange_with_left(handle, my_lid, my_psn, oob_port) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with left neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
@@ -554,6 +553,30 @@ static int post_send(struct pg_handle_t *handle, uint64_t buf_addr, uint32_t siz
     return ibv_post_send(handle->right_qp, &wr, &bad_wr);
 }
 
+static int post_rdma_write(struct pg_handle_t *handle, uint64_t local_addr, uint64_t remote_addr, uint32_t size) {
+    struct ibv_send_wr wr, *bad_wr = NULL;
+    struct ibv_sge sge;
+
+    // Local buffer details
+    sge.addr = local_addr;
+    sge.length = size;
+    sge.lkey = handle->mr->lkey;
+
+    // Describe the send request
+    wr.wr_id = (uint64_t)handle;
+    wr.next = NULL;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED; // Request a completion event
+
+    // Remote buffer details
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = handle->right_remote_dest.rkey;
+
+    return ibv_post_send(handle->right_qp, &wr, &bad_wr);
+}
+
 static void reduce_chunk(void *local_chunk, void *recv_chunk, int chunk_elems, DATATYPE datatype, OPERATION op) {
     if (datatype == TYPE_INT) {
         int *l = (int *)local_chunk;
@@ -610,7 +633,8 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
     int chunk_bytes = chunk_elems * dt_size;
     size_t total_bytes = count * dt_size;
 
-    if (total_bytes + chunk_bytes > MAX_BUF_SIZE) {
+    // We need space for the main data, a receive scratch buffer, and a 1-byte sync buffer
+    if (total_bytes + chunk_bytes + 1 > MAX_BUF_SIZE) {
         fprintf(stderr, "Error: Not enough buffer space for operation.\n");
         return -1;
     }
@@ -619,19 +643,16 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
     memcpy(handle->buf, sendbuf, total_bytes);
 
     // --- PHASE 1: REDUCE-SCATTER ---
-    // In each step `i`, each process `p` sends a chunk to its right neighbor `(p+1)`
-    // and receives a chunk from its left neighbor `(p-1)`. After receiving, it
-    // reduces the incoming chunk with its local chunk.
     // A scratch buffer is used for receiving to prevent overwriting data
     // before it has been used in a local reduction.
-    void *scratch_buf = (char*)handle->buf + total_bytes;
+    void *reduce_scratch_buf = (char*)handle->buf + total_bytes;
 
     for (int i = 0; i < num_nodes - 1; i++) {
         int send_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
         int recv_chunk_idx = (my_rank - 1 - i + num_nodes) % num_nodes;
 
         // Post a receive for the incoming chunk into our scratch space
-        if (post_recv(handle, (uint64_t)scratch_buf, chunk_bytes) != 0) {
+        if (post_recv(handle, (uint64_t)reduce_scratch_buf, chunk_bytes) != 0) {
             fprintf(stderr, "Error: Failed to post receive for Reduce-Scatter.\n");
             return -1;
         }
@@ -649,33 +670,43 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
 
         // Reduce the received chunk (in scratch_buf) with our local chunk
         void *local_chunk_ptr = (char*)handle->buf + (recv_chunk_idx * chunk_bytes);
-        reduce_chunk(local_chunk_ptr, scratch_buf, chunk_elems, datatype, op);
+        reduce_chunk(local_chunk_ptr, reduce_scratch_buf, chunk_elems, datatype, op);
     }
 
-    // --- PHASE 2: ALL-GATHER ---
+    // --- PHASE 2: ALL-GATHER (using RDMA WRITE) ---
     // At this point, each process `p` has the fully reduced chunk `(p+1)%n`.
-    // The All-Gather phase circulates these final chunks around the ring.
+    // The All-Gather phase circulates these final chunks around the ring using RDMA Write.
+    // A separate 1-byte send/recv is used for synchronization to signal completion.
+    void *sync_buf = (char*)reduce_scratch_buf + chunk_bytes; // 1-byte buffer for sync
+
     for (int i = 0; i < num_nodes - 1; i++) {
         // The chunk to send is the one we just finished reducing or receiving.
         int send_chunk_idx = (my_rank - i + 1 + num_nodes) % num_nodes;
         // The chunk to receive is the next one in the sequence from our left.
         int recv_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
 
-        // Post a receive for the next final chunk, placing it in its correct final location.
-        uint64_t recv_buf_addr = (uint64_t)handle->buf + (recv_chunk_idx * chunk_bytes);
-        if (post_recv(handle, recv_buf_addr, chunk_bytes) != 0) {
-            fprintf(stderr, "Error: Failed to post receive for All-Gather.\n");
+        // Post a receive for the 1-byte synchronization signal from the left neighbor.
+        if (post_recv(handle, (uint64_t)sync_buf, 1) != 0) {
+            fprintf(stderr, "Error: Failed to post sync receive for All-Gather.\n");
             return -1;
         }
 
-        // Send the chunk we have to our right neighbor.
-        uint64_t send_buf_addr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
-        if (post_send(handle, send_buf_addr, chunk_bytes) != 0) {
-            fprintf(stderr, "Error: Failed to post send for All-Gather.\n");
+        // RDMA Write the final data chunk directly into the right neighbor's buffer.
+        uint64_t local_vaddr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
+        uint64_t remote_vaddr = handle->right_remote_dest.vaddr + (send_chunk_idx * chunk_bytes);
+        if (post_rdma_write(handle, local_vaddr, remote_vaddr, chunk_bytes) != 0) {
+            fprintf(stderr, "Error: Failed to post RDMA Write for All-Gather.\n");
             return -1;
         }
 
-        // Wait for both operations to complete.
+        // Send a 1-byte synchronization signal to the right neighbor.
+        if (post_send(handle, (uint64_t)sync_buf, 1) != 0) {
+            fprintf(stderr, "Error: Failed to post sync send for All-Gather.\n");
+            return -1;
+        }
+
+        // Wait for all three operations to complete: RDMA Write, sync recv, sync send.
+        if (poll_completion(handle->cq) != 0) return -1;
         if (poll_completion(handle->cq) != 0) return -1;
         if (poll_completion(handle->cq) != 0) return -1;
     }
@@ -691,18 +722,19 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
 // 5. Test Main
 // -----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        printf("Usage: %s <my_rank> <right_neighbor_ip> <num_nodes>\n", argv[0]);
+    if (argc < 4 || argc > 5) {
+        printf("Usage: %s <my_rank> <right_neighbor_ip> <num_nodes> [oob_port]\n", argv[0]);
         return 1;
     }
 
     int my_rank = atoi(argv[1]);
     char *right_ip = argv[2];
     int num_nodes = atoi(argv[3]);
+    int oob_port = (argc == 5) ? atoi(argv[4]) : 18515;
     void *handle = NULL;
 
     // Build the Ring
-    if (connect_process_group(right_ip, my_rank, num_nodes, &handle) != 0) {
+    if (connect_process_group(right_ip, my_rank, num_nodes, &handle, oob_port) != 0) {
         fprintf(stderr, "Failed to connect process group. Exiting.\n");
         return 1;
     }
