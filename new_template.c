@@ -653,10 +653,34 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
     }
 
     // --- PHASE 2: ALL-GATHER ---
-    // TODO: At this point, each process `p` has the fully reduced chunk `(p+1)%n`.
-    // The All-Gather phase would circulate these final chunks around the ring.
+    // At this point, each process `p` has the fully reduced chunk `(p+1)%n`.
+    // The All-Gather phase circulates these final chunks around the ring.
+    for (int i = 0; i < num_nodes - 1; i++) {
+        // The chunk to send is the one we just finished reducing or receiving.
+        int send_chunk_idx = (my_rank - i + 1 + num_nodes) % num_nodes;
+        // The chunk to receive is the next one in the sequence from our left.
+        int recv_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
+
+        // Post a receive for the next final chunk, placing it in its correct final location.
+        uint64_t recv_buf_addr = (uint64_t)handle->buf + (recv_chunk_idx * chunk_bytes);
+        if (post_recv(handle, recv_buf_addr, chunk_bytes) != 0) {
+            fprintf(stderr, "Error: Failed to post receive for All-Gather.\n");
+            return -1;
+        }
+
+        // Send the chunk we have to our right neighbor.
+        uint64_t send_buf_addr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
+        if (post_send(handle, send_buf_addr, chunk_bytes) != 0) {
+            fprintf(stderr, "Error: Failed to post send for All-Gather.\n");
+            return -1;
+        }
+
+        // Wait for both operations to complete.
+        if (poll_completion(handle->cq) != 0) return -1;
+        if (poll_completion(handle->cq) != 0) return -1;
+    }
     
-    // For now, copy the partially reduced buffer to the output.
+    // Copy the final, complete buffer to the user's output buffer.
     memcpy(recvbuf, handle->buf, total_bytes);
     
     return 0;
@@ -683,12 +707,57 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Example usage of print_data (you can uncomment and modify for your tests)
-    // int test_data[2][3] = {{1, 2, 3}, {4, 5, 6}};
-    // print_data(my_rank, "Initial Data", (int*)test_data, 2, 3);
+    // --- All-Reduce Test Setup ---
+    srand(time(NULL) + my_rank); // Seed random number generator uniquely per node
 
-    // Call your future function
-    // pg_all_reduce(NULL, NULL, 1024, TYPE_INT, OP_SUM, handle);
+    const int total_elements = 20;
+    const int rows = 2;
+    const int cols = 10;
+
+    if (total_elements % num_nodes != 0) {
+        fprintf(stderr, "Error: Total elements (%d) must be divisible by num_nodes (%d) for this test.\n", total_elements, num_nodes);
+        pg_close(handle);
+        return 1;
+    }
+
+    int *sendbuf = (int *)malloc(total_elements * sizeof(int));
+    int *recvbuf = (int *)malloc(total_elements * sizeof(int));
+
+    if (!sendbuf || !recvbuf) {
+        fprintf(stderr, "Error: Failed to allocate sendbuf or recvbuf.\n");
+        free(sendbuf);
+        free(recvbuf);
+        pg_close(handle);
+        return 1;
+    }
+
+    // Fill sendbuf with random integers
+    for (int i = 0; i < total_elements; ++i) {
+        sendbuf[i] = rand() % 100; // Random integers between 0 and 99
+    }
+
+    // Initialize recvbuf to all zeros
+    memset(recvbuf, 0, total_elements * sizeof(int));
+
+    // Print data before the operation
+    print_data(my_rank, "BEFORE ALL-REDUCE", sendbuf, rows, cols);
+
+    // Call pg_all_reduce
+    if (pg_all_reduce(sendbuf, recvbuf, total_elements, TYPE_INT, OP_SUM, handle) != 0) {
+        fprintf(stderr, "Error: pg_all_reduce failed.\n");
+        free(sendbuf);
+        free(recvbuf);
+        pg_close(handle);
+        return 1;
+    }
+
+    // Print data after the operation
+    print_data(my_rank, "AFTER ALL-REDUCE", recvbuf, rows, cols);
+
+    // Free allocated arrays
+    free(sendbuf);
+    free(recvbuf);
+    // --- End All-Reduce Test Setup ---
 
     // Teardown
     pg_close(handle);
