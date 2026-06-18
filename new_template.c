@@ -12,6 +12,20 @@
 #define OOB_PORT 18515
 #define MAX_BUF_SIZE (1024 * 1024) // 1MB buffer for All-Reduce
 
+// --- Configuration Macros ---
+#define CQ_DEPTH            200
+#define MAX_SEND_WR         100
+#define MAX_RECV_WR         100
+#define MAX_SEND_SGE        1
+#define MAX_RECV_SGE        1
+#define MIN_RNR_TIMER       12
+#define MAX_DEST_RD_ATOMIC  1
+#define MAX_RD_ATOMIC       1
+#define QP_TIMEOUT          14
+#define RETRY_CNT           7
+#define RNR_RETRY           7
+// ----------------------------
+
 // -----------------------------------------------------------------------------
 // 1. Core Structures
 // -----------------------------------------------------------------------------
@@ -68,10 +82,10 @@ static struct ibv_qp* create_qp(struct pg_handle_t *handle) {
         .send_cq = handle->cq,
         .recv_cq = handle->cq,
         .cap     = {
-            .max_send_wr  = 100,
-            .max_recv_wr  = 100,
-            .max_send_sge = 1,
-            .max_recv_sge = 1,
+            .max_send_wr  = MAX_SEND_WR,
+            .max_recv_wr  = MAX_RECV_WR,
+            .max_send_sge = MAX_SEND_SGE,
+            .max_recv_sge = MAX_RECV_SGE,
         },
         .qp_type = IBV_QPT_RC // Reliable Connection
     };
@@ -94,8 +108,8 @@ static int modify_qp_to_rtr(struct ibv_qp *qp, struct rdma_dest *remote, int ib_
         .path_mtu           = IBV_MTU_1024,
         .dest_qp_num        = remote->qpn,
         .rq_psn             = remote->psn,
-        .max_dest_rd_atomic = 1,
-        .min_rnr_timer      = 12,
+        .max_dest_rd_atomic = MAX_DEST_RD_ATOMIC,
+        .min_rnr_timer      = MIN_RNR_TIMER,
         .ah_attr            = {
             .is_global      = 0,
             .dlid           = remote->lid,
@@ -110,11 +124,11 @@ static int modify_qp_to_rtr(struct ibv_qp *qp, struct rdma_dest *remote, int ib_
 static int modify_qp_to_rts(struct ibv_qp *qp, int my_psn) { //ready to send
     struct ibv_qp_attr attr = {
         .qp_state       = IBV_QPS_RTS,
-        .timeout        = 14,
-        .retry_cnt      = 7,
-        .rnr_retry      = 7,
+        .timeout        = QP_TIMEOUT,
+        .retry_cnt      = RETRY_CNT,
+        .rnr_retry      = RNR_RETRY,
         .sq_psn         = my_psn,
-        .max_rd_atomic  = 1
+        .max_rd_atomic  = MAX_RD_ATOMIC
     };
     return ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
 }
@@ -357,7 +371,7 @@ int connect_process_group(char *servername, int my_rank, void **pg_handle) {
         goto error;
     }
     
-    handle->cq = ibv_create_cq(handle->context, 200, NULL, NULL, 0);
+    handle->cq = ibv_create_cq(handle->context, CQ_DEPTH, NULL, NULL, 0);
     if (!handle->cq) {
         fprintf(stderr, "Error: Failed to create CQ.\n");
         rc = -1;
