@@ -488,6 +488,40 @@ int pg_close(void *pg_handle) {
     return 0;
 }
 
+// Helper function to get the size of the datatype
+static size_t get_datatype_size(DATATYPE datatype) {
+    switch (datatype) {
+        case TYPE_INT: return sizeof(int);
+        case TYPE_FLOAT: return sizeof(float);
+        case TYPE_DOUBLE: return sizeof(double);
+        default: return 0;
+    }
+}
+
+// Helper to poll for a completion
+static int poll_completion(struct ibv_cq *cq) {
+    struct ibv_wc wc;
+    int num_comp;
+
+    do {
+        num_comp = ibv_poll_cq(cq, 1, &wc);
+    } while (num_comp == 0);
+
+    if (num_comp < 0) {
+        fprintf(stderr, "poll_cq failed\n");
+        return -1;
+    }
+
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+                ibv_wc_status_str(wc.status), wc.status, (int)wc.wr_id);
+        return -1;
+    }
+
+    return 0;
+}
+
+
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle) {
     struct pg_handle_t *handle = (struct pg_handle_t *)pg_handle;
     
