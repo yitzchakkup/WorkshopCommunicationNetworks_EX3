@@ -8,6 +8,7 @@
 #include <infiniband/verbs.h>
 #include <stdint.h> // For fixed-width integers
 #include <endian.h> // For htobe64, be64toh
+#include <time.h>   // For time-related functions (though not directly used by print_data, it was requested)
 
 #define OOB_PORT 18515
 #define MAX_BUF_SIZE (1024 * 1024) // 1MB buffer for All-Reduce
@@ -575,6 +576,18 @@ static void reduce_chunk(void *local_chunk, void *recv_chunk, int chunk_elems, D
     }
 }
 
+// Helper function to print a 2D matrix cleanly to the console
+void print_data(int rank, const char* label, int *data, int rows, int cols) {
+    printf("\n=== Node %d: %s ===\n", rank, label);
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols; ++j) {
+            printf("%4d ", data[i * cols + j]);
+        }
+        printf("\n");
+    }
+    printf("=====================\n");
+}
+
 // -----------------------------------------------------------------------------
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle) {
@@ -669,6 +682,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to connect process group. Exiting.\n");
         return 1;
     }
+
+    // Example usage of print_data (you can uncomment and modify for your tests)
+    // int test_data[2][3] = {{1, 2, 3}, {4, 5, 6}};
+    // print_data(my_rank, "Initial Data", (int*)test_data, 2, 3);
 
     // Call your future function
     // pg_all_reduce(NULL, NULL, 1024, TYPE_INT, OP_SUM, handle);
