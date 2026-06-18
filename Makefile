@@ -3,18 +3,14 @@ CFLAGS = -Wall -O2 -D_GNU_SOURCE
 LDFLAGS = -libverbs
 
 # Default target
-all: server client
+all: rdma_allreduce
 
-# Rule to build the server executable
-server: bw_template.c
-	$(CC) $(CFLAGS) -o server bw_template.c $(LDFLAGS)
-
-# Rule to create the client symbolic link pointing to the server
-client: server
-	ln -sf server client
+# Rule to build the executable
+rdma_allreduce: rdma_allreduce_with_ring.c
+	$(CC) $(CFLAGS) -o rdma_allreduce rdma_allreduce.c $(LDFLAGS)
 
 # Rule to clean up the workspace
 clean:
-	rm -f server client
+	rm -f rdma_allreduce
 
 .PHONY: all clean
