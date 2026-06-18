@@ -57,6 +57,10 @@ struct pg_handle_t {
     
     struct rdma_dest   left_remote_dest;
     struct rdma_dest   right_remote_dest;
+
+    // --- New fields for All-Reduce ---
+    int my_rank;
+    int num_nodes;
 };
 
 // Enumeration for collective operations (per your exercise instructions)
@@ -288,16 +292,17 @@ static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip,
 
 int pg_close(void *pg_handle); // Forward declaration
 
-/* * I have added 'my_rank' to your requested signature to prevent TCP deadlocks. 
- * 'servername' acts as the IP address of your right-hand neighbor.
+/* * 'servername' acts as the IP address of your right-hand neighbor.
  */
-int connect_process_group(char *servername, int my_rank, void **pg_handle) {
+int connect_process_group(char *servername, int my_rank, int num_nodes, void **pg_handle) {
     struct pg_handle_t *handle = calloc(1, sizeof(struct pg_handle_t));
     if (!handle) {
         fprintf(stderr, "Error: Could not allocate memory for pg_handle_t\n");
         return -1;
     }
     *pg_handle = handle;
+    handle->my_rank = my_rank;
+    handle->num_nodes = num_nodes;
 
     uint32_t my_psn = rand() & 0xffffff;
     struct ibv_device **dev_list = NULL;
@@ -454,7 +459,7 @@ int connect_process_group(char *servername, int my_rank, void **pg_handle) {
         goto error;
     }
 
-    printf("Rank %d successfully formed the RDMA Ring!\n", my_rank);
+    printf("Rank %d of %d successfully formed the RDMA Ring!\n", my_rank, num_nodes);
     ibv_free_device_list(dev_list);
     return 0;
 
@@ -498,17 +503,18 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
 // 5. Test Main
 // -----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        printf("Usage: %s <my_rank> <right_neighbor_ip>\n", argv[0]);
+    if (argc != 4) {
+        printf("Usage: %s <my_rank> <right_neighbor_ip> <num_nodes>\n", argv[0]);
         return 1;
     }
 
     int my_rank = atoi(argv[1]);
     char *right_ip = argv[2];
+    int num_nodes = atoi(argv[3]);
     void *handle = NULL;
 
     // Build the Ring
-    if (connect_process_group(right_ip, my_rank, &handle) != 0) {
+    if (connect_process_group(right_ip, my_rank, num_nodes, &handle) != 0) {
         fprintf(stderr, "Failed to connect process group. Exiting.\n");
         return 1;
     }
