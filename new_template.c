@@ -262,22 +262,51 @@ int connect_process_group(char *servername, int my_rank, void **pg_handle) {
     }
     *pg_handle = handle;
 
-    int ib_port = 1;
     int my_psn = rand() & 0xffffff;
     struct ibv_device **dev_list = NULL;
     int rc = 0;
+    int num_devices = 0;
+    int ib_port = -1;
+    struct ibv_port_attr portinfo;
 
     // 1. Device and Memory Setup
-    dev_list = ibv_get_device_list(NULL);
-    if (!dev_list) {
+    dev_list = ibv_get_device_list(&num_devices);
+    if (!dev_list || num_devices == 0) {
         fprintf(stderr, "Error: Failed to get IB device list.\n");
         rc = -1;
         goto error;
     }
 
-    handle->context = ibv_open_device(dev_list[0]);
-    if (!handle->context) {
-        fprintf(stderr, "Error: Failed to open IB device.\n");
+    for (int i = 0; i < num_devices; i++) {
+        handle->context = ibv_open_device(dev_list[i]);
+        if (!handle->context) continue;
+
+        struct ibv_device_attr device_attr;
+        if (ibv_query_device(handle->context, &device_attr) != 0) {
+            ibv_close_device(handle->context);
+            handle->context = NULL;
+            continue;
+        }
+
+        for (uint8_t p = 1; p <= device_attr.phys_port_cnt; p++) {
+            if (ibv_query_port(handle->context, p, &portinfo) == 0) {
+                if (portinfo.state == IBV_PORT_ACTIVE) {
+                    ib_port = p;
+                    break;
+                }
+            }
+        }
+
+        if (ib_port != -1) {
+            break; // Found active port
+        }
+
+        ibv_close_device(handle->context);
+        handle->context = NULL;
+    }
+
+    if (!handle->context || ib_port == -1) {
+        fprintf(stderr, "Error: Failed to find an active IB device and port.\n");
         rc = -1;
         goto error;
     }
@@ -339,12 +368,6 @@ int connect_process_group(char *servername, int my_rank, void **pg_handle) {
         goto error;
     }
 
-    struct ibv_port_attr portinfo;
-    if (ibv_query_port(handle->context, ib_port, &portinfo) != 0) {
-        fprintf(stderr, "Error: Failed to query port info.\n");
-        rc = -1;
-        goto error;
-    }
     int my_lid = portinfo.lid;
 
     // 3. Avoid Deadlocks using Rank (Even listens first, Odd connects first)
