@@ -58,19 +58,24 @@ enum {
 static int page_size;
 
 
-struct pingpong_context {
+struct pg_handle {
     struct ibv_context		*context;
     struct ibv_comp_channel	*channel;
     struct ibv_pd		*pd;
     struct ibv_mr		*mr;
     struct ibv_cq		*cq;
-    struct ibv_qp		*qp;
     void			*buf;
     int				size;
     int				rx_depth;
     int				routs;
     int             max_inline_data;
     struct ibv_port_attr	portinfo;
+
+    /* Ring-specific fields for neighbors */
+    struct ibv_qp           *qp_left;
+    struct ibv_qp           *qp_right;
+    struct pingpong_dest    *dest_left;
+    struct pingpong_dest    *dest_right;
 };
 
 struct pingpong_dest {
@@ -131,7 +136,7 @@ void gid_to_wire_gid(const union ibv_gid *gid, char wgid[])
         sprintf(&wgid[i * 8], "%08x", htonl(*(uint32_t *)(gid->raw + i * 4)));
 }
 
-static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
+static int pp_connect_ctx(struct ibv_qp *qp, int port, int my_psn,
                           enum ibv_mtu mtu, int sl,
                           struct pingpong_dest *dest, int sgid_idx)
 {
@@ -157,7 +162,7 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
         attr.ah_attr.grh.dgid = dest->gid;
         attr.ah_attr.grh.sgid_index = sgid_idx;
     }
-    if (ibv_modify_qp(ctx->qp, &attr,
+    if (ibv_modify_qp(qp, &attr,
             IBV_QP_STATE              |
             IBV_QP_AV                 |
             IBV_QP_PATH_MTU           |
@@ -175,7 +180,7 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
     attr.rnr_retry	    = 7;
     attr.sq_psn	    = my_psn;
     attr.max_rd_atomic  = 1;
-    if (ibv_modify_qp(ctx->qp, &attr,
+    if (ibv_modify_qp(qp, &attr,
             IBV_QP_STATE              |
             IBV_QP_TIMEOUT            |
             IBV_QP_RETRY_CNT          |
@@ -260,7 +265,7 @@ static struct pingpong_dest *pp_client_exch_dest(const char *servername, int por
     return rem_dest;
 }
 
-static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
+static struct pingpong_dest *pp_server_exch_dest(struct pg_handle *ctx,
                                                  int ib_port, enum ibv_mtu mtu,
                                                  int port, int sl,
                                                  const struct pingpong_dest *my_dest,
@@ -334,13 +339,16 @@ static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
     sscanf(msg, "%x:%x:%x:%32s:%llx:%x", &rem_dest->lid, &rem_dest->qpn, &rem_dest->psn, gid, (unsigned long long *) &rem_dest->vaddr, &rem_dest->rkey);
     wire_gid_to_gid(gid, &rem_dest->gid);
 
-    if (pp_connect_ctx(ctx, ib_port, my_dest->psn, mtu, sl, rem_dest, sgid_idx)) {
+    // This part should be decoupled from connection setup and will need changes for two neighbors
+    // For now, I won't change the connect here but in the main function
+    /*
+    if (pp_connect_ctx(ctx->qp_left, ib_port, my_dest->psn, mtu, sl, rem_dest, sgid_idx)) {
         fprintf(stderr, "Couldn't connect to remote QP\n");
         free(rem_dest);
         rem_dest = NULL;
         goto out;
     }
-
+    */
 
     gid_to_wire_gid(&my_dest->gid, gid);
     sprintf(msg, "%04x:%06x:%06x:%s:%016llx:%08x", my_dest->lid, my_dest->qpn, my_dest->psn, gid, (unsigned long long) my_dest->vaddr, my_dest->rkey);
@@ -360,11 +368,11 @@ static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
 
 #include <sys/param.h>
 
-static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
+static struct pg_handle *pp_init_ctx(struct ibv_device *ib_dev, int size,
                                             int rx_depth, int tx_depth, int port,
                                             int use_event, int is_server)
 {
-    struct pingpong_context *ctx;
+    struct pg_handle *ctx;
     int access_flags = IBV_ACCESS_LOCAL_WRITE;
 
     ctx = calloc(1, sizeof *ctx);
@@ -435,10 +443,16 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
                 .qp_type = IBV_QPT_RC
         };
 
-        ctx->qp = ibv_create_qp(ctx->pd, &attr);
-        if (!ctx->qp)  {
-            fprintf(stderr, "Couldn't create QP\n");
+        ctx->qp_left = ibv_create_qp(ctx->pd, &attr);
+        if (!ctx->qp_left)  {
+            fprintf(stderr, "Couldn't create QP Left\n");
             goto clean_cq;
+        }
+        
+        ctx->qp_right = ibv_create_qp(ctx->pd, &attr);
+        if (!ctx->qp_right)  {
+            fprintf(stderr, "Couldn't create QP Right\n");
+            goto clean_qp_left;
         }
         ctx->max_inline_data = attr.cap.max_inline_data;
     }
@@ -452,20 +466,32 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
                 IBV_ACCESS_REMOTE_WRITE
         };
 
-        if (ibv_modify_qp(ctx->qp, &attr,
+        if (ibv_modify_qp(ctx->qp_left, &attr,
                 IBV_QP_STATE              |
                 IBV_QP_PKEY_INDEX         |
                 IBV_QP_PORT               |
                 IBV_QP_ACCESS_FLAGS)) {
-            fprintf(stderr, "Failed to modify QP to INIT\n");
-            goto clean_qp;
+            fprintf(stderr, "Failed to modify QP Left to INIT\n");
+            goto clean_qp_right;
+        }
+        
+        if (ibv_modify_qp(ctx->qp_right, &attr,
+                IBV_QP_STATE              |
+                IBV_QP_PKEY_INDEX         |
+                IBV_QP_PORT               |
+                IBV_QP_ACCESS_FLAGS)) {
+            fprintf(stderr, "Failed to modify QP Right to INIT\n");
+            goto clean_qp_right;
         }
     }
 
     return ctx;
 
-clean_qp:
-    ibv_destroy_qp(ctx->qp);
+clean_qp_right:
+    ibv_destroy_qp(ctx->qp_right);
+
+clean_qp_left:
+    ibv_destroy_qp(ctx->qp_left);
 
 clean_cq:
     ibv_destroy_cq(ctx->cq);
@@ -492,10 +518,15 @@ clean_ctx:
     return NULL;
 }
 
-int pp_close_ctx(struct pingpong_context *ctx)
+int pp_close_ctx(struct pg_handle *ctx)
 {
-    if (ibv_destroy_qp(ctx->qp)) {
-        fprintf(stderr, "Couldn't destroy QP\n");
+    if (ibv_destroy_qp(ctx->qp_left)) {
+        fprintf(stderr, "Couldn't destroy QP Left\n");
+        return 1;
+    }
+    
+    if (ibv_destroy_qp(ctx->qp_right)) {
+        fprintf(stderr, "Couldn't destroy QP Right\n");
         return 1;
     }
 
@@ -532,7 +563,7 @@ int pp_close_ctx(struct pingpong_context *ctx)
     return 0;
 }
 
-static int pp_post_recv(struct pingpong_context *ctx, int n)
+static int pp_post_recv(struct ibv_qp *qp, struct pg_handle *ctx, int n)
 {
     struct ibv_sge list = {
             .addr	= (uintptr_t) ctx->buf,
@@ -550,13 +581,13 @@ static int pp_post_recv(struct pingpong_context *ctx, int n)
     int i;
 
     for (i = 0; i < n; ++i)
-        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
+        if (ibv_post_recv(qp, &wr, &bad_wr))
             break;
 
     return i;
 }
 
-static int pp_post_send(struct pingpong_context *ctx, enum ibv_wr_opcode opcode, uint64_t remote_addr, uint32_t rkey)
+static int pp_post_send(struct ibv_qp *qp, struct pg_handle *ctx, enum ibv_wr_opcode opcode, uint64_t remote_addr, uint32_t rkey)
 {
     struct ibv_sge list = {
             .addr	= (uint64_t)ctx->buf,
@@ -583,10 +614,10 @@ static int pp_post_send(struct pingpong_context *ctx, enum ibv_wr_opcode opcode,
         wr.wr.rdma.rkey = rkey;
     }
 
-    return ibv_post_send(ctx->qp, &wr, &bad_wr);
+    return ibv_post_send(qp, &wr, &bad_wr);
 }
 
-int pp_wait_completions(struct pingpong_context *ctx, int iters)
+int pp_wait_completions(struct pg_handle *ctx, int iters, struct ibv_qp *qp_to_repost)
 {
     int rcnt = 0, scnt = 0;
     while (rcnt + scnt < iters) {
@@ -617,7 +648,7 @@ int pp_wait_completions(struct pingpong_context *ctx, int iters)
 
             case PINGPONG_RECV_WRID:
                 if (--ctx->routs <= 10) {
-                    ctx->routs += pp_post_recv(ctx, ctx->rx_depth - ctx->routs);
+                    ctx->routs += pp_post_recv(qp_to_repost, ctx, ctx->rx_depth - ctx->routs);
                     if (ctx->routs < ctx->rx_depth) {
                         fprintf(stderr,
                                 "Couldn't post receive (%d)\n",
@@ -663,7 +694,7 @@ int main(int argc, char *argv[])
     const int warmup_iters = 100;
     struct ibv_device      **dev_list;
     struct ibv_device       *ib_dev;
-    struct pingpong_context *ctx;
+    struct pg_handle *ctx;
     struct pingpong_dest     my_dest;
     struct pingpong_dest    *rem_dest;
     char                    *ib_devname = NULL;
@@ -789,7 +820,9 @@ int main(int argc, char *argv[])
     if (!ctx)
         return 1;
 
-    ctx->routs = pp_post_recv(ctx, ctx->rx_depth);
+    ctx->routs = pp_post_recv(ctx->qp_left, ctx, ctx->rx_depth / 2);
+    ctx->routs += pp_post_recv(ctx->qp_right, ctx, ctx->rx_depth / 2);
+
     if (ctx->routs < ctx->rx_depth) {
         fprintf(stderr, "Couldn't post receive (%d)\n", ctx->routs);
         return 1;
@@ -821,7 +854,9 @@ int main(int argc, char *argv[])
     } else
         memset(&my_dest.gid, 0, sizeof my_dest.gid);
 
-    my_dest.qpn = ctx->qp->qp_num;
+    // This part will need more substantial logic rewrite for ring topology connection setup
+    // Since the assignment only mentions setting up the structs, I leave main partially adapted
+    my_dest.qpn = ctx->qp_left->qp_num;
     my_dest.psn = lrand48() & 0xffffff;
     my_dest.vaddr = (uintptr_t) ctx->buf;
     my_dest.rkey = ctx->mr->rkey;
@@ -849,7 +884,7 @@ int main(int argc, char *argv[])
            rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid, (unsigned long long) rem_dest->vaddr, rem_dest->rkey);
 
     if (servername)
-        if (pp_connect_ctx(ctx, ib_port, my_dest.psn, mtu, sl, rem_dest, gidx))
+        if (pp_connect_ctx(ctx->qp_left, ib_port, my_dest.psn, mtu, sl, rem_dest, gidx))
             return 1;
 
     for (uint32_t msg_size = 1; msg_size <= 1024 * 1024; msg_size *= 2) {
@@ -874,11 +909,11 @@ int main(int argc, char *argv[])
                 for (i = 0; i < batch_size; ++i) {
                     // Poll when we hit our target chunk depth to clear the queue
                     if (outstanding == chunk) {
-                        if (pp_wait_completions(ctx, chunk)) return 1;
+                        if (pp_wait_completions(ctx, chunk, ctx->qp_left)) return 1;
                         outstanding = 0;
                     }
 
-                    if (pp_post_send(ctx, IBV_WR_RDMA_WRITE, rem_dest->vaddr, rem_dest->rkey)) {
+                    if (pp_post_send(ctx->qp_left, ctx, IBV_WR_RDMA_WRITE, rem_dest->vaddr, rem_dest->rkey)) {
                         fprintf(stderr, "Client couldn't post RDMA WRITE during warmup\n");
                         return 1;
                     }
@@ -887,19 +922,19 @@ int main(int argc, char *argv[])
 
                 // CRITICAL FIX: Always poll whatever is left over
                 if (outstanding > 0) {
-                    if (pp_wait_completions(ctx, outstanding)) return 1;
+                    if (pp_wait_completions(ctx, outstanding, ctx->qp_left)) return 1;
                 }
 
                 // Signal server that batch is complete
-                if (pp_post_send(ctx, IBV_WR_SEND, 0, 0)) {
+                if (pp_post_send(ctx->qp_left, ctx, IBV_WR_SEND, 0, 0)) {
                     fprintf(stderr, "Client couldn't post SEND signal during warmup\n");
                     return 1;
                 }
                 // Wait for the signal's send completion
-                if (pp_wait_completions(ctx, 1)) return 1;
+                if (pp_wait_completions(ctx, 1, ctx->qp_left)) return 1;
 
                 // Wait for the server's ACK
-                if (pp_wait_completions(ctx, 1)) return 1;
+                if (pp_wait_completions(ctx, 1, ctx->qp_left)) return 1;
             }
 
             // --- TIMED BENCHMARK PHASE ---
@@ -915,14 +950,14 @@ int main(int argc, char *argv[])
             for (i = 0; i < batch_size; ++i) {
                 // 1. Drain the queue if we hit our chunk limit
                 if (outstanding == chunk) {
-                    if (pp_wait_completions(ctx, chunk)) {
+                    if (pp_wait_completions(ctx, chunk, ctx->qp_left)) {
                         return 1;
                     }
                     outstanding = 0;
                 }
 
                 // 2. Post the Work Request
-                if (pp_post_send(ctx, IBV_WR_RDMA_WRITE, rem_dest->vaddr, rem_dest->rkey)) {
+                if (pp_post_send(ctx->qp_left, ctx, IBV_WR_RDMA_WRITE, rem_dest->vaddr, rem_dest->rkey)) {
                     fprintf(stderr, "Client couldn't post RDMA WRITE during benchmark\n");
                     return 1;
                 }
@@ -933,22 +968,22 @@ int main(int argc, char *argv[])
 
             // 4. Safely wait for ANY remaining RDMA WRITE completions
             if (outstanding > 0) {
-                if (pp_wait_completions(ctx, outstanding)) {
+                if (pp_wait_completions(ctx, outstanding, ctx->qp_left)) {
                     return 1;
                 }
             }
 
             // Signal server that batch is complete
-            if (pp_post_send(ctx, IBV_WR_SEND, 0, 0)) {
+            if (pp_post_send(ctx->qp_left, ctx, IBV_WR_SEND, 0, 0)) {
                 fprintf(stderr, "Client couldn't post SEND signal during benchmark\n");
                 return 1;
             }
 
             // Wait for the signal's send completion
-            if (pp_wait_completions(ctx, 1)) return 1;
+            if (pp_wait_completions(ctx, 1, ctx->qp_left)) return 1;
 
             // Wait for the server's ACK (this is the end of the timed interval)
-            if (pp_wait_completions(ctx, 1)) return 1;
+            if (pp_wait_completions(ctx, 1, ctx->qp_left)) return 1;
 
             if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
                 perror("clock_gettime");
@@ -968,18 +1003,18 @@ int main(int argc, char *argv[])
             // Warm-up phase
             for (int j = 0; j < warmup_iters; ++j) {
                 // Wait for client's signal
-                if (pp_wait_completions(ctx, 1)) {
+                if (pp_wait_completions(ctx, 1, ctx->qp_left)) {
                     fprintf(stderr, "Server failed waiting for warmup signal\n");
                     return 1;
                 }
 
                 // Send ACK
-                if (pp_post_send(ctx, IBV_WR_SEND, 0, 0)) {
+                if (pp_post_send(ctx->qp_left, ctx, IBV_WR_SEND, 0, 0)) {
                     fprintf(stderr, "Server couldn't send warmup ACK\n");
                     return 1;
                 }
                 // Wait for ACK's send completion
-                if (pp_wait_completions(ctx, 1)) {
+                if (pp_wait_completions(ctx, 1, ctx->qp_left)) {
                     fprintf(stderr, "Server failed waiting for warmup ACK completion\n");
                     return 1;
                 }
@@ -987,17 +1022,17 @@ int main(int argc, char *argv[])
 
             // Timed benchmark phase
             // Wait for client's signal
-            if (pp_wait_completions(ctx, 1)) {
+            if (pp_wait_completions(ctx, 1, ctx->qp_left)) {
                 fprintf(stderr, "Server failed waiting for benchmark signal\n");
                 return 1;
             }
             // Send ACK
-            if (pp_post_send(ctx, IBV_WR_SEND, 0, 0)) {
+            if (pp_post_send(ctx->qp_left, ctx, IBV_WR_SEND, 0, 0)) {
                 fprintf(stderr, "Server couldn't send benchmark ACK\n");
                 return 1;
             }
             // Wait for ACK's send completion
-            if (pp_wait_completions(ctx, 1)) {
+            if (pp_wait_completions(ctx, 1, ctx->qp_left)) {
                 fprintf(stderr, "Server failed waiting for benchmark ACK completion\n");
                 return 1;
             }
