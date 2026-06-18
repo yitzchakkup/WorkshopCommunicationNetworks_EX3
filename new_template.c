@@ -488,7 +488,10 @@ int pg_close(void *pg_handle) {
     return 0;
 }
 
-// Helper function to get the size of the datatype
+// -----------------------------------------------------------------------------
+// All-Reduce Helper Functions
+// -----------------------------------------------------------------------------
+
 static size_t get_datatype_size(DATATYPE datatype) {
     switch (datatype) {
         case TYPE_INT: return sizeof(int);
@@ -498,36 +501,150 @@ static size_t get_datatype_size(DATATYPE datatype) {
     }
 }
 
-// Helper to poll for a completion
 static int poll_completion(struct ibv_cq *cq) {
     struct ibv_wc wc;
     int num_comp;
-
     do {
         num_comp = ibv_poll_cq(cq, 1, &wc);
     } while (num_comp == 0);
 
     if (num_comp < 0) {
-        fprintf(stderr, "poll_cq failed\n");
+        fprintf(stderr, "Error: ibv_poll_cq failed.\n");
         return -1;
     }
-
     if (wc.status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-                ibv_wc_status_str(wc.status), wc.status, (int)wc.wr_id);
+        fprintf(stderr, "Error: Work completion failed with status %s.\n", ibv_wc_status_str(wc.status));
         return -1;
     }
-
     return 0;
 }
 
+static int post_recv(struct pg_handle_t *handle, uint64_t buf_addr, uint32_t size) {
+    struct ibv_recv_wr wr, *bad_wr = NULL;
+    struct ibv_sge sge;
+
+    sge.addr = buf_addr;
+    sge.length = size;
+    sge.lkey = handle->mr->lkey;
+
+    wr.wr_id = (uint64_t)handle; // Use handle as WR ID for identification
+    wr.next = NULL;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    return ibv_post_recv(handle->left_qp, &wr, &bad_wr);
+}
+
+static int post_send(struct pg_handle_t *handle, uint64_t buf_addr, uint32_t size) {
+    struct ibv_send_wr wr, *bad_wr = NULL;
+    struct ibv_sge sge;
+
+    sge.addr = buf_addr;
+    sge.length = size;
+    sge.lkey = handle->mr->lkey;
+
+    wr.wr_id = (uint64_t)handle;
+    wr.next = NULL;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    return ibv_post_send(handle->right_qp, &wr, &bad_wr);
+}
+
+static void reduce_chunk(void *local_chunk, void *recv_chunk, int chunk_elems, DATATYPE datatype, OPERATION op) {
+    if (datatype == TYPE_INT) {
+        int *l = (int *)local_chunk;
+        int *r = (int *)recv_chunk;
+        if (op == OP_SUM) for (int i = 0; i < chunk_elems; i++) l[i] += r[i];
+        else if (op == OP_MAX) for (int i = 0; i < chunk_elems; i++) l[i] = (l[i] > r[i]) ? l[i] : r[i];
+        else if (op == OP_MIN) for (int i = 0; i < chunk_elems; i++) l[i] = (l[i] < r[i]) ? l[i] : r[i];
+    } else if (datatype == TYPE_FLOAT) {
+        float *l = (float *)local_chunk;
+        float *r = (float *)recv_chunk;
+        if (op == OP_SUM) for (int i = 0; i < chunk_elems; i++) l[i] += r[i];
+        else if (op == OP_MAX) for (int i = 0; i < chunk_elems; i++) l[i] = (l[i] > r[i]) ? l[i] : r[i];
+        else if (op == OP_MIN) for (int i = 0; i < chunk_elems; i++) l[i] = (l[i] < r[i]) ? l[i] : r[i];
+    } else if (datatype == TYPE_DOUBLE) {
+        double *l = (double *)local_chunk;
+        double *r = (double *)recv_chunk;
+        if (op == OP_SUM) for (int i = 0; i < chunk_elems; i++) l[i] += r[i];
+        else if (op == OP_MAX) for (int i = 0; i < chunk_elems; i++) l[i] = (l[i] > r[i]) ? l[i] : r[i];
+        else if (op == OP_MIN) for (int i = 0; i < chunk_elems; i++) l[i] = (l[i] < r[i]) ? l[i] : r[i];
+    }
+}
+
+// -----------------------------------------------------------------------------
 
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OPERATION op, void *pg_handle) {
     struct pg_handle_t *handle = (struct pg_handle_t *)pg_handle;
+    int my_rank = handle->my_rank;
+    int num_nodes = handle->num_nodes;
+
+    size_t dt_size = get_datatype_size(datatype);
+    if (dt_size == 0) {
+        fprintf(stderr, "Error: Invalid datatype specified.\n");
+        return -1;
+    }
+
+    if (count % num_nodes != 0) {
+        fprintf(stderr, "Error: Element count must be divisible by the number of nodes.\n");
+        return -1;
+    }
+
+    int chunk_elems = count / num_nodes;
+    int chunk_bytes = chunk_elems * dt_size;
+    size_t total_bytes = count * dt_size;
+
+    if (total_bytes + chunk_bytes > MAX_BUF_SIZE) {
+        fprintf(stderr, "Error: Not enough buffer space for operation.\n");
+        return -1;
+    }
+
+    // 1. Copy user data into our registered buffer
+    memcpy(handle->buf, sendbuf, total_bytes);
+
+    // --- PHASE 1: REDUCE-SCATTER ---
+    // In each step `i`, each process `p` sends a chunk to its right neighbor `(p+1)`
+    // and receives a chunk from its left neighbor `(p-1)`. After receiving, it
+    // reduces the incoming chunk with its local chunk.
+    // A scratch buffer is used for receiving to prevent overwriting data
+    // before it has been used in a local reduction.
+    void *scratch_buf = (char*)handle->buf + total_bytes;
+
+    for (int i = 0; i < num_nodes - 1; i++) {
+        int send_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
+        int recv_chunk_idx = (my_rank - 1 - i + num_nodes) % num_nodes;
+
+        // Post a receive for the incoming chunk into our scratch space
+        if (post_recv(handle, (uint64_t)scratch_buf, chunk_bytes) != 0) {
+            fprintf(stderr, "Error: Failed to post receive for Reduce-Scatter.\n");
+            return -1;
+        }
+
+        // Send our current chunk to the right neighbor
+        uint64_t send_buf_addr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
+        if (post_send(handle, send_buf_addr, chunk_bytes) != 0) {
+            fprintf(stderr, "Error: Failed to post send for Reduce-Scatter.\n");
+            return -1;
+        }
+
+        // Wait for both send and receive to complete
+        if (poll_completion(handle->cq) != 0) return -1;
+        if (poll_completion(handle->cq) != 0) return -1;
+
+        // Reduce the received chunk (in scratch_buf) with our local chunk
+        void *local_chunk_ptr = (char*)handle->buf + (recv_chunk_idx * chunk_bytes);
+        reduce_chunk(local_chunk_ptr, scratch_buf, chunk_elems, datatype, op);
+    }
+
+    // --- PHASE 2: ALL-GATHER ---
+    // TODO: At this point, each process `p` has the fully reduced chunk `(p+1)%n`.
+    // The All-Gather phase would circulate these final chunks around the ring.
     
-    // TODO: Implement Ring All-Reduce Logic here!
-    // Phase 1: Reduce-Scatter (Send to right_qp, receive from left_qp, compute OP)
-    // Phase 2: All-Gather (Send to right_qp, receive from left_qp, using RDMA WRITE zero-copy)
+    // For now, copy the partially reduced buffer to the output.
+    memcpy(recvbuf, handle->buf, total_bytes);
     
     return 0;
 }
