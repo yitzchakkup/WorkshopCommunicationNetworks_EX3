@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <infiniband/verbs.h>
+#include <stdint.h> // For fixed-width integers
+#include <endian.h> // For htobe64, be64toh
 
 #define OOB_PORT 18515
 #define MAX_BUF_SIZE (1024 * 1024) // 1MB buffer for All-Reduce
@@ -14,13 +16,16 @@
 // 1. Core Structures
 // -----------------------------------------------------------------------------
 
-// The Out-Of-Band (TCP) data we need to exchange to connect QPs
+// The Out-Of-Band (TCP) data we need to exchange to connect QPs.
+// This struct is exchanged as-is, so we use fixed-size types and
+// handle endianness conversion to make it portable.
+// The fields are ordered to minimize padding.
 struct rdma_dest {
-    int lid;
-    int qpn;
-    int psn;
-    uint64_t vaddr;
-    uint32_t rkey;
+    uint64_t vaddr;      // Buffer virtual address
+    uint32_t rkey;       // Remote key
+    uint32_t qpn;        // Queue pair number
+    uint32_t psn;        // Packet sequence number
+    uint16_t lid;        // LID of the IB port
 };
 
 // The hidden implementation of your void **pg_handle
@@ -120,10 +125,9 @@ static int modify_qp_to_rts(struct ibv_qp *qp, int my_psn) { //ready to send
 // -----------------------------------------------------------------------------
 
 // Accepts connection from the LEFT neighbor
-static int exchange_with_left(struct pg_handle_t *handle, int my_lid, int my_psn, int port) {
+static int exchange_with_left(struct pg_handle_t *handle, uint16_t my_lid, uint32_t my_psn, int port) {
     int sockfd, connfd;
     struct sockaddr_in serv_addr;
-    char msg[128];
     ssize_t bytes;
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -164,21 +168,31 @@ static int exchange_with_left(struct pg_handle_t *handle, int my_lid, int my_psn
     }
 
     // 1. Read Left's coordinates
-    bytes = read(connfd, msg, sizeof(msg));
-    if (bytes <= 0) {
+    struct rdma_dest remote_dest_net;
+    bytes = read(connfd, &remote_dest_net, sizeof(remote_dest_net));
+    if (bytes != sizeof(remote_dest_net)) {
         fprintf(stderr, "Error: Failed to read from left neighbor (read returned %zd).\n", bytes);
         close(connfd);
         return -1;
     }
-    sscanf(msg, "%x:%x:%x:%llx:%x", &handle->left_remote_dest.lid, &handle->left_remote_dest.qpn, 
-           &handle->left_remote_dest.psn, (unsigned long long*)&handle->left_remote_dest.vaddr, 
-           &handle->left_remote_dest.rkey);
+
+    // Convert from network to host byte order
+    handle->left_remote_dest.vaddr = be64toh(remote_dest_net.vaddr);
+    handle->left_remote_dest.rkey = ntohl(remote_dest_net.rkey);
+    handle->left_remote_dest.qpn = ntohl(remote_dest_net.qpn);
+    handle->left_remote_dest.psn = ntohl(remote_dest_net.psn);
+    handle->left_remote_dest.lid = ntohs(remote_dest_net.lid);
 
     // 2. Send My coordinates (specifically my left_qp so they can write to me)
-    sprintf(msg, "%04x:%06x:%06x:%016llx:%08x", my_lid, handle->left_qp->qp_num, my_psn, 
-            (unsigned long long)handle->buf, handle->mr->rkey);
-    bytes = write(connfd, msg, sizeof(msg));
-    if (bytes <= 0) {
+    struct rdma_dest my_dest_net;
+    my_dest_net.vaddr = htobe64((uint64_t)handle->buf);
+    my_dest_net.rkey = htonl(handle->mr->rkey);
+    my_dest_net.qpn = htonl(handle->left_qp->qp_num);
+    my_dest_net.psn = htonl(my_psn);
+    my_dest_net.lid = htons(my_lid);
+
+    bytes = write(connfd, &my_dest_net, sizeof(my_dest_net));
+    if (bytes != sizeof(my_dest_net)) {
         fprintf(stderr, "Error: Failed to write to left neighbor (write returned %zd).\n", bytes);
         close(connfd);
         return -1;
@@ -189,10 +203,9 @@ static int exchange_with_left(struct pg_handle_t *handle, int my_lid, int my_psn
 }
 
 // Initiates connection to the RIGHT neighbor
-static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip, int my_lid, int my_psn, int port) {
+static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip, uint16_t my_lid, uint32_t my_psn, int port) {
     int sockfd;
     struct sockaddr_in serv_addr;
-    char msg[128];
     ssize_t bytes;
 
     memset(&serv_addr, 0, sizeof(serv_addr));
@@ -220,25 +233,35 @@ static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip,
     }
 
     // 1. Send My coordinates (specifically my right_qp so I can read their acks)
-    sprintf(msg, "%04x:%06x:%06x:%016llx:%08x", my_lid, handle->right_qp->qp_num, my_psn, 
-            (unsigned long long)handle->buf, handle->mr->rkey);
-    bytes = write(sockfd, msg, sizeof(msg));
-    if (bytes <= 0) {
+    struct rdma_dest my_dest_net;
+    my_dest_net.vaddr = htobe64((uint64_t)handle->buf);
+    my_dest_net.rkey = htonl(handle->mr->rkey);
+    my_dest_net.qpn = htonl(handle->right_qp->qp_num);
+    my_dest_net.psn = htonl(my_psn);
+    my_dest_net.lid = htons(my_lid);
+
+    bytes = write(sockfd, &my_dest_net, sizeof(my_dest_net));
+    if (bytes != sizeof(my_dest_net)) {
         fprintf(stderr, "Error: Failed to write to right neighbor (write returned %zd).\n", bytes);
         close(sockfd);
         return -1;
     }
 
     // 2. Read Right's coordinates
-    bytes = read(sockfd, msg, sizeof(msg));
-    if (bytes <= 0) {
+    struct rdma_dest remote_dest_net;
+    bytes = read(sockfd, &remote_dest_net, sizeof(remote_dest_net));
+    if (bytes != sizeof(remote_dest_net)) {
         fprintf(stderr, "Error: Failed to read from right neighbor (read returned %zd).\n", bytes);
         close(sockfd);
         return -1;
     }
-    sscanf(msg, "%x:%x:%x:%llx:%x", &handle->right_remote_dest.lid, &handle->right_remote_dest.qpn, 
-           &handle->right_remote_dest.psn, (unsigned long long*)&handle->right_remote_dest.vaddr, 
-           &handle->right_remote_dest.rkey);
+
+    // Convert from network to host byte order
+    handle->right_remote_dest.vaddr = be64toh(remote_dest_net.vaddr);
+    handle->right_remote_dest.rkey = ntohl(remote_dest_net.rkey);
+    handle->right_remote_dest.qpn = ntohl(remote_dest_net.qpn);
+    handle->right_remote_dest.psn = ntohl(remote_dest_net.psn);
+    handle->right_remote_dest.lid = ntohs(remote_dest_net.lid);
 
     close(sockfd);
     return 0;
@@ -262,7 +285,7 @@ int connect_process_group(char *servername, int my_rank, void **pg_handle) {
     }
     *pg_handle = handle;
 
-    int my_psn = rand() & 0xffffff;
+    uint32_t my_psn = rand() & 0xffffff;
     struct ibv_device **dev_list = NULL;
     int rc = 0;
     int num_devices = 0;
@@ -368,7 +391,7 @@ int connect_process_group(char *servername, int my_rank, void **pg_handle) {
         goto error;
     }
 
-    int my_lid = portinfo.lid;
+    uint16_t my_lid = portinfo.lid;
 
     // 3. Avoid Deadlocks using Rank (Even listens first, Odd connects first)
     if (my_rank % 2 == 0) {
