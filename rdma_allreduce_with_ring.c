@@ -58,6 +58,10 @@ struct pg_handle_t {
     struct rdma_dest   left_remote_dest;
     struct rdma_dest   right_remote_dest;
 
+    // OOB TCP sockets to neighbors (kept open until QPs are RTS and pairwise sync completes)
+    int left_sockfd;
+    int right_sockfd;
+
     // --- New fields for All-Reduce ---
     int my_rank;
     int num_nodes;
@@ -143,7 +147,9 @@ static int modify_qp_to_rts(struct ibv_qp *qp, int my_psn) { //ready to send
 // -----------------------------------------------------------------------------
 
 // Accepts connection from the LEFT neighbor
-static int exchange_with_left(struct pg_handle_t *handle, uint16_t my_lid, uint32_t my_psn, int port) {
+// Accepts connection from the LEFT neighbor
+// On success returns 0 and stores an open connected socket fd in *connfd_out (DO NOT close it)
+static int exchange_with_left(struct pg_handle_t *handle, uint16_t my_lid, uint32_t my_psn, int port, int *connfd_out) {
     int sockfd, connfd;
     struct sockaddr_in serv_addr;
     ssize_t bytes;
@@ -216,12 +222,15 @@ static int exchange_with_left(struct pg_handle_t *handle, uint16_t my_lid, uint3
         return -1;
     }
 
-    close(connfd);
+    // Leave connfd open for the pairwise READY sync later
+    *connfd_out = connfd;
     return 0;
 }
 
 // Initiates connection to the RIGHT neighbor
-static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip, uint16_t my_lid, uint32_t my_psn, int port) {
+// Initiates connection to the RIGHT neighbor
+// On success returns 0 and stores an open connected socket fd in *sockfd_out (DO NOT close it)
+static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip, uint16_t my_lid, uint32_t my_psn, int port, int *sockfd_out) {
     int sockfd;
     struct sockaddr_in serv_addr;
     ssize_t bytes;
@@ -281,7 +290,8 @@ static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip,
     handle->right_remote_dest.psn = ntohl(remote_dest_net.psn);
     handle->right_remote_dest.lid = ntohs(remote_dest_net.lid);
 
-    close(sockfd);
+    // Leave sockfd open for the pairwise READY sync later
+    *sockfd_out = sockfd;
     return 0;
 }
 
@@ -303,6 +313,8 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
     *pg_handle = handle;
     handle->my_rank = my_rank;
     handle->num_nodes = num_nodes;
+    handle->left_sockfd = -1;
+    handle->right_sockfd = -1;
 
     uint32_t my_psn = rand() & 0xffffff;
     struct ibv_device **dev_list = NULL;
@@ -414,23 +426,23 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
 
     // 3. Avoid Deadlocks using Rank (Even listens first, Odd connects first)
     if (my_rank % 2 == 0) {
-        if (exchange_with_left(handle, my_lid, my_psn, oob_port) != 0) {
+        if (exchange_with_left(handle, my_lid, my_psn, oob_port, &handle->left_sockfd) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with left neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
         }
-        if (exchange_with_right(handle, servername, my_lid, my_psn, oob_port) != 0) {
+        if (exchange_with_right(handle, servername, my_lid, my_psn, oob_port, &handle->right_sockfd) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with right neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
         }
     } else {
-        if (exchange_with_right(handle, servername, my_lid, my_psn, oob_port) != 0) {
+        if (exchange_with_right(handle, servername, my_lid, my_psn, oob_port, &handle->right_sockfd) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with right neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
         }
-        if (exchange_with_left(handle, my_lid, my_psn, oob_port) != 0) {
+        if (exchange_with_left(handle, my_lid, my_psn, oob_port, &handle->left_sockfd) != 0) {
             fprintf(stderr, "Rank %d: OOB exchange with left neighbor failed.\n", my_rank);
             rc = -1;
             goto error;
@@ -459,6 +471,49 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         goto error;
     }
 
+    // --- PAIRWISE TCP SYNC (Hardware-ready barrier) ---
+    // Each node writes a 1-byte READY to both neighbors and then reads a 1-byte READY from both.
+    {
+        char ready = 1;
+        char peer_ready = 0;
+        ssize_t n;
+
+        // Send READY to left and right neighbors (non-blocking from protocol perspective).
+        n = write(handle->left_sockfd, &ready, 1);
+        if (n != 1) {
+            fprintf(stderr, "Rank %d: Failed to send READY to LEFT neighbor (wrote %zd).\n", my_rank, n);
+            rc = -1;
+            goto error;
+        }
+        n = write(handle->right_sockfd, &ready, 1);
+        if (n != 1) {
+            fprintf(stderr, "Rank %d: Failed to send READY to RIGHT neighbor (wrote %zd).\n", my_rank, n);
+            rc = -1;
+            goto error;
+        }
+
+        // Read READY from left neighbor
+        n = read(handle->left_sockfd, &peer_ready, 1);
+        if (n != 1) {
+            fprintf(stderr, "Rank %d: Failed to read READY from LEFT neighbor (read %zd).\n", my_rank, n);
+            rc = -1;
+            goto error;
+        }
+        // Read READY from right neighbor
+        n = read(handle->right_sockfd, &peer_ready, 1);
+        if (n != 1) {
+            fprintf(stderr, "Rank %d: Failed to read READY from RIGHT neighbor (read %zd).\n", my_rank, n);
+            rc = -1;
+            goto error;
+        }
+
+        // Close the OOB sockets after successful handshake
+        close(handle->left_sockfd);
+        close(handle->right_sockfd);
+        handle->left_sockfd = -1;
+        handle->right_sockfd = -1;
+    }
+
     printf("Rank %d of %d successfully formed the RDMA Ring!\n", my_rank, num_nodes);
     ibv_free_device_list(dev_list);
     return 0;
@@ -477,6 +532,8 @@ int pg_close(void *pg_handle) {
     if (!handle) {
         return 0;
     }
+    if (handle->left_sockfd >= 0) close(handle->left_sockfd);
+    if (handle->right_sockfd >= 0) close(handle->right_sockfd);
     if (handle->left_qp) ibv_destroy_qp(handle->left_qp);
     if (handle->right_qp) ibv_destroy_qp(handle->right_qp);
     if (handle->cq) ibv_destroy_cq(handle->cq);
