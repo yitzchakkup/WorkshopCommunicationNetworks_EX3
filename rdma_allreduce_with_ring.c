@@ -228,36 +228,45 @@ static int exchange_with_left(struct pg_handle_t *handle, uint16_t my_lid, uint3
 }
 
 // Initiates connection to the RIGHT neighbor
-// Initiates connection to the RIGHT neighbor
 // On success returns 0 and stores an open connected socket fd in *sockfd_out (DO NOT close it)
 static int exchange_with_right(struct pg_handle_t *handle, const char *right_ip, uint16_t my_lid, uint32_t my_psn, int port, int *sockfd_out) {
     int sockfd;
-    struct sockaddr_in serv_addr;
     ssize_t bytes;
+    struct addrinfo hints, *res;
+    char port_str[16];
 
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, right_ip, &serv_addr.sin_addr) <= 0) {
-        fprintf(stderr, "Error: Invalid right neighbor IP address '%s'.\n", right_ip);
+    // Convert port integer to string for getaddrinfo
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;       // IPv4
+    hints.ai_socktype = SOCK_STREAM; // TCP
+
+    // Resolve the hostname or IP address
+    if (getaddrinfo(right_ip, port_str, &hints, &res) != 0) {
+        fprintf(stderr, "Error: Could not resolve hostname or IP '%s'.\n", right_ip);
         return -1;
     }
 
     printf("Connecting to RIGHT neighbor at %s:%d...\n", right_ip, port);
-    
+
     // Retry connection until the other side is ready
     while (1) {
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (sockfd < 0) {
             perror("socket");
+            freeaddrinfo(res);
             return -1; // Non-recoverable
         }
-        if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
+
+        if (connect(sockfd, res->ai_addr, res->ai_addrlen) == 0) {
             break; // Success
         }
         close(sockfd);
         usleep(100000); // Retry every 100ms
     }
+
+    freeaddrinfo(res); // Clean up the resolved address memory
 
     // 1. Send My coordinates (specifically my right_qp so I can read their acks)
     struct rdma_dest my_dest_net;
