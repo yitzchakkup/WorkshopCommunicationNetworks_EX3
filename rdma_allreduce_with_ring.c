@@ -633,99 +633,100 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
     int chunk_bytes = chunk_elems * dt_size;
     size_t total_bytes = count * dt_size;
 
-    // We need space for the main data, two receive scratch buffers, and a 1-byte sync buffer
-    if (total_bytes + 2 * chunk_bytes + 1 > MAX_BUF_SIZE) {
-        fprintf(stderr, "Error: Not enough buffer space for operation.\n");
+    // We need space for the main data, TWO receive scratch buffers, and a 1-byte sync buffer
+    if (total_bytes + (2 * chunk_bytes) + 1 > MAX_BUF_SIZE) {
+        fprintf(stderr, "Error: Not enough buffer space for double-buffered operation.\n");
         return -1;
     }
 
     // 1. Copy user data into our registered buffer
     memcpy(handle->buf, sendbuf, total_bytes);
 
-    // --- PHASE 1: REDUCE-SCATTER (with Phase-Shifted Double Buffering) ---
-    // Two scratch buffers for ping-pong buffering to overlap communication and computation.
-    void *scratch_A = (char*)handle->buf + total_bytes;
-    void *scratch_B = (char*)scratch_A + chunk_bytes;
+    // --- PHASE 1: REDUCE-SCATTER (Pipelined Double-Buffering) ---
+    void *reduce_scratch_buf[2];
+    reduce_scratch_buf[0] = (char*)handle->buf + total_bytes;
+    reduce_scratch_buf[1] = (char*)handle->buf + total_bytes + chunk_bytes;
 
-    for (int i = 0; i < num_nodes - 1; i++) {
-        int send_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
-        int recv_chunk_idx = (my_rank - 1 - i + num_nodes) % num_nodes;
+    // --- Prime the Pipeline (Step 0) ---
+    int send_chunk_idx = my_rank;
+    int recv_chunk_idx = (my_rank - 1 + num_nodes) % num_nodes;
 
-        // Determine which buffer is for this receive (ping-pong)
-        void *recv_buf = (i % 2 == 0) ? scratch_A : scratch_B;
-        void *prev_buf = (i % 2 == 0) ? scratch_B : scratch_A;
-
-        // Post a receive for the incoming chunk into the designated scratch buffer
-        if (post_recv(handle, (uint64_t)recv_buf, chunk_bytes) != 0) {
-            fprintf(stderr, "Error: Failed to post receive for Reduce-Scatter.\n");
-            return -1;
-        }
-
-        // Send our current chunk to the right neighbor
-        uint64_t send_buf_addr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
-        if (post_send(handle, send_buf_addr, chunk_bytes) != 0) {
-            fprintf(stderr, "Error: Failed to post send for Reduce-Scatter.\n");
-            return -1;
-        }
-
-        // OVERLAP: While NIC processes the send/recv, compute on the previous buffer
-        // For i=0, there is no previous data yet, so skip the reduce_chunk
-        if (i > 0) {
-            void *local_chunk_ptr = (char*)handle->buf + (recv_chunk_idx * chunk_bytes);
-            reduce_chunk(local_chunk_ptr, prev_buf, chunk_elems, datatype, op);
-        }
-
-        // Wait for both send and receive to complete
-        if (poll_completion(handle->cq) != 0) return -1;
-        if (poll_completion(handle->cq) != 0) return -1;
+    // Post first receive into scratch buffer 0
+    if (post_recv(handle, (uint64_t)reduce_scratch_buf[0], chunk_bytes) != 0) {
+        fprintf(stderr, "Error: Failed to post initial receive.\n");
+        return -1;
+    }
+    // Post first send
+    uint64_t send_buf_addr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
+    if (post_send(handle, send_buf_addr, chunk_bytes) != 0) {
+        fprintf(stderr, "Error: Failed to post initial send.\n");
+        return -1;
     }
 
-    // Final reduce_chunk: Process the last received chunk
-    // After the loop, determine which buffer holds the final received data
-    void *final_recv_buf = ((num_nodes - 2) % 2 == 0) ? scratch_A : scratch_B;
-    int final_recv_chunk_idx = (my_rank - 1 - (num_nodes - 2) + num_nodes) % num_nodes;
-    void *final_local_chunk_ptr = (char*)handle->buf + (final_recv_chunk_idx * chunk_bytes);
-    reduce_chunk(final_local_chunk_ptr, final_recv_buf, chunk_elems, datatype, op);
+    // --- The Pipeline Loop (Steps 1 to num_nodes - 1) ---
+    for (int step = 1; step < num_nodes; step++) {
+        // A. Wait for the PREVIOUS step's send and receive to complete
+        if (poll_completion(handle->cq) != 0) return -1; // Previous Recv
+        if (poll_completion(handle->cq) != 0) return -1; // Previous Send
+
+        // B. Post the NEXT receive early so hardware works in the background
+        if (step < num_nodes - 1) {
+            if (post_recv(handle, (uint64_t)reduce_scratch_buf[step % 2], chunk_bytes) != 0) {
+                fprintf(stderr, "Error: Failed to post receive in step %d.\n", step);
+                return -1;
+            }
+        }
+
+        // C. Compute reduction on the data that just arrived from the PREVIOUS step
+        recv_chunk_idx = (my_rank - step + num_nodes) % num_nodes;
+        void *local_chunk_ptr = (char*)handle->buf + (recv_chunk_idx * chunk_bytes);
+        reduce_chunk(local_chunk_ptr, reduce_scratch_buf[(step - 1) % 2], chunk_elems, datatype, op);
+
+        // D. NOW post the send for the chunk we *just finished reducing*
+        if (step < num_nodes - 1) {
+            send_chunk_idx = (my_rank - step + num_nodes) % num_nodes;
+            send_buf_addr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
+            if (post_send(handle, send_buf_addr, chunk_bytes) != 0) {
+                fprintf(stderr, "Error: Failed to post send in step %d.\n", step);
+                return -1;
+            }
+        }
+    }
 
     // --- PHASE 2: ALL-GATHER (using RDMA WRITE) ---
-    // At this point, each process `p` has the fully reduced chunk `(p+1)%n`.
-    // The All-Gather phase circulates these final chunks around the ring using RDMA Write.
-    // A separate 1-byte send/recv is used for synchronization to signal completion.
-    void *sync_buf = (char*)scratch_B + chunk_bytes; // 1-byte buffer for sync
+    // The sync buffer must sit safely AFTER the two scratch buffers
+    void *sync_buf = (char*)reduce_scratch_buf[1] + chunk_bytes;
 
     for (int i = 0; i < num_nodes - 1; i++) {
-        // The chunk to send is the one we just finished reducing or receiving.
-        int send_chunk_idx = (my_rank - i + 1 + num_nodes) % num_nodes;
-        // The chunk to receive is the next one in the sequence from our left.
-        int recv_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
+        int send_chunk_idx_ag = (my_rank - i + 1 + num_nodes) % num_nodes;
 
-        // Post a receive for the 1-byte synchronization signal from the left neighbor.
+        // Post a receive for the 1-byte synchronization signal
         if (post_recv(handle, (uint64_t)sync_buf, 1) != 0) {
             fprintf(stderr, "Error: Failed to post sync receive for All-Gather.\n");
             return -1;
         }
 
-        // RDMA Write the final data chunk directly into the right neighbor's buffer.
-        uint64_t local_vaddr = (uint64_t)handle->buf + (send_chunk_idx * chunk_bytes);
-        uint64_t remote_vaddr = handle->right_remote_dest.vaddr + (send_chunk_idx * chunk_bytes);
+        // RDMA Write the final data chunk directly
+        uint64_t local_vaddr = (uint64_t)handle->buf + (send_chunk_idx_ag * chunk_bytes);
+        uint64_t remote_vaddr = handle->right_remote_dest.vaddr + (send_chunk_idx_ag * chunk_bytes);
         if (post_rdma_write(handle, local_vaddr, remote_vaddr, chunk_bytes) != 0) {
             fprintf(stderr, "Error: Failed to post RDMA Write for All-Gather.\n");
             return -1;
         }
 
-        // Send a 1-byte synchronization signal to the right neighbor.
+        // Send a 1-byte synchronization signal
         if (post_send(handle, (uint64_t)sync_buf, 1) != 0) {
             fprintf(stderr, "Error: Failed to post sync send for All-Gather.\n");
             return -1;
         }
 
-        // Wait for all three operations to complete: RDMA Write, sync recv, sync send.
-        if (poll_completion(handle->cq) != 0) return -1;
-        if (poll_completion(handle->cq) != 0) return -1;
-        if (poll_completion(handle->cq) != 0) return -1;
+        // Wait for all three operations to complete
+        if (poll_completion(handle->cq) != 0) return -1; // RDMA Write completion
+        if (poll_completion(handle->cq) != 0) return -1; // Sync receive completion
+        if (poll_completion(handle->cq) != 0) return -1; // Sync send completion
     }
-    
-    // Copy the final, complete buffer to the user's output buffer.
+
+    // Copy the final, complete buffer to the user's output buffer
     memcpy(recvbuf, handle->buf, total_bytes);
     
     return 0;
