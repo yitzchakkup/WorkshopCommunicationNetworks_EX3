@@ -318,7 +318,7 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         rc = -1;
         goto error;
     }
-
+    // look for an infiniband device
     for (int i = 0; i < num_devices; i++) {
         handle->context = ibv_open_device(dev_list[i]);
         if (!handle->context) continue;
@@ -329,7 +329,7 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
             handle->context = NULL;
             continue;
         }
-
+        // look for an available port
         for (uint8_t p = 1; p <= device_attr.phys_port_cnt; p++) {
             if (ibv_query_port(handle->context, p, &portinfo) == 0) {
                 if (portinfo.state == IBV_PORT_ACTIVE) {
