@@ -352,14 +352,14 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         rc = -1;
         goto error;
     }
-
+    // allocate memory to the protection domain
     handle->pd = ibv_alloc_pd(handle->context);
     if (!handle->pd) {
         fprintf(stderr, "Error: Failed to allocate PD.\n");
         rc = -1;
         goto error;
     }
-    
+    // allocate memory to the process' buffer
     handle->buf = malloc(MAX_BUF_SIZE);
     if (!handle->buf) {
         fprintf(stderr, "Error: Failed to allocate memory for buffer.\n");
@@ -367,7 +367,7 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         goto error;
     }
     memset(handle->buf, 0, MAX_BUF_SIZE);
-
+    // allow for RDMA write and read operations to the buffer by local and remote precesses
     handle->mr = ibv_reg_mr(handle->pd, handle->buf, MAX_BUF_SIZE, 
                             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!handle->mr) {
@@ -375,7 +375,7 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         rc = -1;
         goto error;
     }
-    
+    // create a copletion queue
     handle->cq = ibv_create_cq(handle->context, CQ_DEPTH, NULL, NULL, 0);
     if (!handle->cq) {
         fprintf(stderr, "Error: Failed to create CQ.\n");
@@ -383,7 +383,7 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         goto error;
     }
 
-    // 2. Create the Two Ring QPs
+    // 2. Create the Two Ring QPs, left and right
     handle->left_qp = create_qp(handle);
     if (!handle->left_qp) {
         fprintf(stderr, "Error: Failed to create left QP.\n");
@@ -397,7 +397,7 @@ int connect_process_group(char *servername, int my_rank, int num_nodes, void **p
         rc = -1;
         goto error;
     }
-
+    // initialize left and right qps
     if (modify_qp_to_init(handle->left_qp, ib_port) != 0) {
         fprintf(stderr, "Error: Failed to modify left QP to INIT.\n");
         rc = -1;
@@ -633,8 +633,8 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
     int chunk_bytes = chunk_elems * dt_size;
     size_t total_bytes = count * dt_size;
 
-    // We need space for the main data, a receive scratch buffer, and a 1-byte sync buffer
-    if (total_bytes + chunk_bytes + 1 > MAX_BUF_SIZE) {
+    // We need space for the main data, two receive scratch buffers, and a 1-byte sync buffer
+    if (total_bytes + 2 * chunk_bytes + 1 > MAX_BUF_SIZE) {
         fprintf(stderr, "Error: Not enough buffer space for operation.\n");
         return -1;
     }
@@ -642,17 +642,21 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
     // 1. Copy user data into our registered buffer
     memcpy(handle->buf, sendbuf, total_bytes);
 
-    // --- PHASE 1: REDUCE-SCATTER ---
-    // A scratch buffer is used for receiving to prevent overwriting data
-    // before it has been used in a local reduction.
-    void *reduce_scratch_buf = (char*)handle->buf + total_bytes;
+    // --- PHASE 1: REDUCE-SCATTER (with Phase-Shifted Double Buffering) ---
+    // Two scratch buffers for ping-pong buffering to overlap communication and computation.
+    void *scratch_A = (char*)handle->buf + total_bytes;
+    void *scratch_B = (char*)scratch_A + chunk_bytes;
 
     for (int i = 0; i < num_nodes - 1; i++) {
         int send_chunk_idx = (my_rank - i + num_nodes) % num_nodes;
         int recv_chunk_idx = (my_rank - 1 - i + num_nodes) % num_nodes;
 
-        // Post a receive for the incoming chunk into our scratch space
-        if (post_recv(handle, (uint64_t)reduce_scratch_buf, chunk_bytes) != 0) {
+        // Determine which buffer is for this receive (ping-pong)
+        void *recv_buf = (i % 2 == 0) ? scratch_A : scratch_B;
+        void *prev_buf = (i % 2 == 0) ? scratch_B : scratch_A;
+
+        // Post a receive for the incoming chunk into the designated scratch buffer
+        if (post_recv(handle, (uint64_t)recv_buf, chunk_bytes) != 0) {
             fprintf(stderr, "Error: Failed to post receive for Reduce-Scatter.\n");
             return -1;
         }
@@ -664,20 +668,30 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
             return -1;
         }
 
+        // OVERLAP: While NIC processes the send/recv, compute on the previous buffer
+        // For i=0, there is no previous data yet, so skip the reduce_chunk
+        if (i > 0) {
+            void *local_chunk_ptr = (char*)handle->buf + (recv_chunk_idx * chunk_bytes);
+            reduce_chunk(local_chunk_ptr, prev_buf, chunk_elems, datatype, op);
+        }
+
         // Wait for both send and receive to complete
         if (poll_completion(handle->cq) != 0) return -1;
         if (poll_completion(handle->cq) != 0) return -1;
-
-        // Reduce the received chunk (in scratch_buf) with our local chunk
-        void *local_chunk_ptr = (char*)handle->buf + (recv_chunk_idx * chunk_bytes);
-        reduce_chunk(local_chunk_ptr, reduce_scratch_buf, chunk_elems, datatype, op);
     }
+
+    // Final reduce_chunk: Process the last received chunk
+    // After the loop, determine which buffer holds the final received data
+    void *final_recv_buf = ((num_nodes - 2) % 2 == 0) ? scratch_A : scratch_B;
+    int final_recv_chunk_idx = (my_rank - 1 - (num_nodes - 2) + num_nodes) % num_nodes;
+    void *final_local_chunk_ptr = (char*)handle->buf + (final_recv_chunk_idx * chunk_bytes);
+    reduce_chunk(final_local_chunk_ptr, final_recv_buf, chunk_elems, datatype, op);
 
     // --- PHASE 2: ALL-GATHER (using RDMA WRITE) ---
     // At this point, each process `p` has the fully reduced chunk `(p+1)%n`.
     // The All-Gather phase circulates these final chunks around the ring using RDMA Write.
     // A separate 1-byte send/recv is used for synchronization to signal completion.
-    void *sync_buf = (char*)reduce_scratch_buf + chunk_bytes; // 1-byte buffer for sync
+    void *sync_buf = (char*)scratch_B + chunk_bytes; // 1-byte buffer for sync
 
     for (int i = 0; i < num_nodes - 1; i++) {
         // The chunk to send is the one we just finished reducing or receiving.
