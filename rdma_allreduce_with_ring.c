@@ -898,6 +898,16 @@ static int run_benchmark(int my_rank, int num_nodes, void *handle, size_t max_by
     }
 
     int rc = 0;
+
+    // One-time warm-up at the largest size: pays first-touch costs (page faults, NIC address
+    // translation for the whole buffer) once, so they don't land on whichever size runs first.
+    const int global_warmup = 20;
+    int max_count = (int)(max_bytes / sizeof(int)) / num_nodes * num_nodes;
+    if (max_count == 0) max_count = num_nodes;
+    for (int w = 0; w < global_warmup; w++) {
+        if (pg_all_reduce(sendbuf, recvbuf, max_count, TYPE_INT, OP_SUM, handle) != 0) { rc = -1; goto out; }
+    }
+
     size_t prev_bytes = 0;
     for (size_t target = sizeof(int); target <= max_bytes; target *= 2) {
         int count = (int)(target / sizeof(int)) / num_nodes * num_nodes;
@@ -906,10 +916,13 @@ static int run_benchmark(int my_rank, int num_nodes, void *handle, size_t max_by
         if (bytes == prev_bytes || bytes > max_bytes) continue;
         prev_bytes = bytes;
 
-        // Warm up, then size the timed loop to ~TARGET_SEC from the slowest rank's warm-up time.
+        // Short per-size warm-up (re-syncs the ranks and settles caches for this size), then size
+        // the timed loop to ~TARGET_SEC from the slowest rank's warm-up time.
         // All ranks must run the same number of iterations, hence the MAX all-reduce.
         const double TARGET_SEC = 0.5;
-        const int warmup = 5;
+        const int warmup = 10;
+        const int MIN_ITERS = 100;
+        const int MAX_ITERS = 1000;
         memset(recvbuf, 0, bytes);
         double tw = now_sec();
         for (int w = 0; w < warmup; w++) {
@@ -918,7 +931,7 @@ static int run_benchmark(int my_rank, int num_nodes, void *handle, size_t max_by
         for (int i = 0; i < num_nodes; i++) t_stat[i] = (now_sec() - tw) / warmup;
         if (pg_all_reduce(t_stat, t_max, num_nodes, TYPE_DOUBLE, OP_MAX, handle) != 0) { rc = -1; goto out; }
         double iters_d = TARGET_SEC / t_max[0];
-        int iters = iters_d > 1000 ? 1000 : (iters_d < 5 ? 5 : (int)iters_d);
+        int iters = iters_d > MAX_ITERS ? MAX_ITERS : (iters_d < MIN_ITERS ? MIN_ITERS : (int)iters_d);
 
         double t0 = now_sec();
         for (int it = 0; it < iters; it++) {
