@@ -3,6 +3,7 @@
 
 Usage: python3 plot_results.py [allreduce_results.csv] [allreduce_results.png]
        python3 plot_results.py --compare comparison.png run_2nodes.csv run_3nodes.csv ...
+       python3 plot_results.py --latency latency.png run_2nodes.csv run_3nodes.csv ...
 """
 import csv
 import sys
@@ -105,7 +106,35 @@ def plot_compare(png_path, csv_paths):
     print(f"Saved {png_path}")
 
 
+def plot_latency(png_path, csv_paths):
+    runs = sorted((load(p) for p in csv_paths), key=lambda d: d["num_nodes"])
+    line = dict(linewidth=2, marker="o", markersize=5,
+                markeredgecolor=SURFACE, markeredgewidth=1.5)
+
+    fig, ax = plt.subplots(figsize=(8, 5.2), facecolor=SURFACE)
+    for d in runs:
+        n = d["num_nodes"]
+        ax.plot(d["bytes"], d["time_us"], color=NODE_COLORS.get(n, TEXT_SECONDARY),
+                label=f"{n} nodes", **line)
+    style_axes(ax, "Average time per all-reduce (slowest rank)", "µs (log scale)")
+    ax.set_yscale("log")
+    leg = ax.legend(loc="upper left", frameon=False, fontsize=9)
+    for t in leg.get_texts():
+        t.set_color(TEXT_PRIMARY)
+
+    fig.suptitle("RDMA ring all-reduce · latency vs message size · int32 SUM",
+                 x=0.01, ha="left", color=TEXT_PRIMARY, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(png_path, dpi=150, facecolor=SURFACE)
+    print(f"Saved {png_path}")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--latency":
+        if len(sys.argv) < 4:
+            sys.exit(__doc__)
+        plot_latency(sys.argv[2], sys.argv[3:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--compare":
         if len(sys.argv) < 4:
             sys.exit(__doc__)

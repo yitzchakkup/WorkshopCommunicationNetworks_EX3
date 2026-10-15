@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This exercise implements a distributed All-Reduce collective communication primitive over InfiniBand using the Verbs API. The operation combines data from all participating nodes (at least 2, tested with 2 and 4) by applying a reduction operation (SUM, MAX, or MIN) over integer, float, or double arrays, and delivers the identical result to every node. The implementation decomposes All-Reduce into two canonical phases: **Reduce-Scatter** and **All-Gather**, arranged in a logical ring topology, with pipelining applied to the Reduce-Scatter phase to overlap communication and computation.
+This exercise implements a distributed All-Reduce collective communication primitive over InfiniBand using the Verbs API. The operation combines data from all participating nodes (at least 2, tested with 2, 3 and 4) by applying a reduction operation (SUM, MAX, or MIN) over integer, float, or double arrays, and delivers the identical result to every node. The implementation decomposes All-Reduce into two canonical phases: **Reduce-Scatter** and **All-Gather**, arranged in a logical ring topology, with pipelining applied to the Reduce-Scatter phase to overlap communication and computation.
 
 ---
 
@@ -36,7 +36,7 @@ Before any TCP exchange, each node allocates its RDMA resources in the following
 
 1. **IB device and active port** – The code iterates over all available InfiniBand devices and selects the first port in `IBV_PORT_ACTIVE` state.
 2. **Protection Domain (PD)** – A PD scopes all subsequent memory registrations and QPs.
-3. **Memory Region (MR)** – A 1 MB buffer is registered with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ`, granting both local and remote processes the right to read and write into this buffer. The resulting `lkey` and `rkey` are used in all subsequent RDMA operations.
+3. **Memory Region (MR)** – A `MAX_BUF_SIZE` buffer (4 MB by default, overridable with `make MAX_BUF_SIZE=...`) is registered with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ`, granting both local and remote processes the right to read and write into this buffer. The resulting `lkey` and `rkey` are used in all subsequent RDMA operations.
 4. **Completion Queue (CQ)** – Depth 200, shared by both QPs.
 5. **Two QPs** (`left_qp`, `right_qp`) – Created in `IBV_QPT_RC` (Reliable Connection) mode, then immediately transitioned to `IBV_QPS_INIT`.
 
@@ -189,7 +189,7 @@ Then wait for all three completions before advancing. The sync signal acts as a 
 
 ## 6. Buffer Memory Layout
 
-All RDMA-accessible memory lives in a single 1 MB registered buffer (`handle->buf`). The layout during `pg_all_reduce` is:
+All RDMA-accessible memory lives in a single registered buffer of `MAX_BUF_SIZE` bytes (4 MB by default) (`handle->buf`). The layout during `pg_all_reduce` is:
 
 ```
 Offset 0:
@@ -230,3 +230,67 @@ The opaque `pg_handle` passed between calls is internally a `struct pg_handle_t`
 | All-Gather synchronization | 1-byte TCP-style send over RDMA | Lightweight; notifies receiver without extra memory registration |
 | Completion detection | Busy-poll (`ibv_poll_cq`) | Lowest latency; appropriate for HPC workloads |
 | Supported types | INT, FLOAT, DOUBLE × SUM, MAX, MIN | Matches exercise `DATATYPE` and `OPERATION` enumerations |
+
+---
+
+## 9. Performance Evaluation
+
+### 9.1 Setup and Methodology
+
+The benchmark is built into `rdma_allreduce` and driven by `run_benchmark.sh all`, which runs rings of 2, 3 and 4 nodes on `mlx-stud-01` … `mlx-stud-04` (rank *i* on `mlx-stud-0(i+1)`). The numbers below come from the run in `results/all_20261015_144736/`.
+
+- **Operation**: `TYPE_INT`, `OP_SUM`.
+- **Message sizes**: powers of two, rounded down to a multiple of `N` integers so that every node gets an equal chunk (for example, the "16 B" row of the 3-node ring is really 12 B). The sweep stops at the largest message that fits in the 4 MB registered buffer together with the two scratch chunks and the sync byte: 1 MB for 2 nodes and 2 MB for 3 and 4 nodes.
+- **Timing**: 5 warm-up calls, then a timed loop sized to take about 0.5 s (between 5 and 1000 iterations). Each rank measures its own average time per call, and the reported time is the **slowest rank's** average, gathered with an `OP_MAX` all-reduce.
+- **Bandwidth**: algorithm bandwidth `AlgBW = bytes × 8 / time`; bus bandwidth `BusBW = AlgBW × 2(N−1)/N`, the data each link actually carries in a ring all-reduce, which makes rings of different sizes comparable.
+- **Correctness**: every node fills `sendbuf[i] = rank + (i mod 1000)` and checks after every size that `recvbuf[i] = N(N−1)/2 + N·(i mod 1000)`. All sizes on all ring sizes passed with 0 wrong elements.
+
+### 9.2 Bandwidth
+
+![Algorithm and bus bandwidth vs. message size for 2, 3 and 4 nodes](results/all_20261015_144736/comparison.png)
+
+*Figure 1 – Algorithm bandwidth (left) and bus bandwidth (right) against message size. For N = 2 the factor 2(N−1)/N is 1, so the two are equal.*
+
+### 9.3 Latency
+
+![Average time per all-reduce vs. message size, log scale](results/all_20261015_144736/latency.png)
+
+*Figure 2 – Average time per all-reduce call (slowest rank), log scale.*
+
+### 9.4 Results Table
+
+| Size | 2 nodes: time (µs) | 2 nodes: BusBW (Gb/s) | 3 nodes: time (µs) | 3 nodes: BusBW (Gb/s) | 4 nodes: time (µs) | 4 nodes: BusBW (Gb/s) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 B | 13.9 | 0.005 | — | — | — | — |
+| 16 B | 9.3 | 0.014 | 1,516.6 | 0.000 | 1,236.3 | 0.000 |
+| 32 B | 8.2 | 0.031 | 812.0 | 0.000 | 3,535.5 | 0.000 |
+| 64 B | 9.5 | 0.054 | 2,375.6 | 0.000 | 3,600.4 | 0.000 |
+| 128 B | 12.1 | 0.084 | 1,358.2 | 0.001 | 2,647.6 | 0.001 |
+| 256 B | 10.3 | 0.200 | 1,155.1 | 0.002 | 2,221.7 | 0.001 |
+| 512 B | 10.2 | 0.403 | 2,412.6 | 0.002 | 3,577.7 | 0.002 |
+| 1 KB | 9.4 | 0.867 | 274.6 | 0.040 | 3,420.6 | 0.004 |
+| 2 KB | 10.1 | 1.617 | 1,703.6 | 0.013 | 3,030.3 | 0.008 |
+| 4 KB | 16.7 | 1.966 | 658.1 | 0.066 | 523.1 | 0.094 |
+| 8 KB | 17.0 | 3.860 | 927.3 | 0.094 | 2,781.3 | 0.035 |
+| 16 KB | 22.9 | 5.713 | 1,254.9 | 0.139 | 294.6 | 0.667 |
+| 32 KB | 35.1 | 7.468 | 1,755.0 | 0.199 | 2,124.3 | 0.185 |
+| 64 KB | 83.8 | 6.257 | 1,968.6 | 0.355 | 3,236.6 | 0.243 |
+| 128 KB | 129.1 | 8.119 | 2,227.3 | 0.628 | 3,078.8 | 0.511 |
+| 256 KB | 286.8 | 7.312 | 1,311.8 | 2.132 | 2,900.5 | 1.085 |
+| 512 KB | 517.6 | 8.104 | 2,284.1 | 2.448 | 3,190.7 | 1.972 |
+| 1 MB | 1,579.6 | 5.311 | 2,760.9 | 4.051 | 3,852.3 | 3.266 |
+| 2 MB | — | — | 3,215.7 | 6.956 | 4,794.4 | 5.249 |
+
+*Table 1 – Average time per call and bus bandwidth. "—" means that size was not part of that ring's sweep. Full per-run data, including iteration counts and algorithm bandwidth, is in `results/all_20261015_144736/<N>nodes/allreduce_results.csv`.*
+
+Per-ring charts are also available: [2 nodes](results/all_20261015_144736/2nodes/allreduce_results.png), [3 nodes](results/all_20261015_144736/3nodes/allreduce_results.png), [4 nodes](results/all_20261015_144736/4nodes/allreduce_results.png).
+
+### 9.5 Observations
+
+1. **Two nodes behave as expected.** Up to 2 KB the time stays flat at about 8–14 µs, so small messages are bound by per-operation latency. From 4 KB on, bandwidth rises quickly and levels off at about **8.1 Gb/s** (128 KB and 512 KB), where the link is the bottleneck. The drop to 5.3 Gb/s at 1 MB comes from a single measurement and would need repeated runs before drawing conclusions.
+
+2. **Three and four nodes have a millisecond-scale floor.** Messages of 2 KB and below take 0.3–3.6 ms on 3 and 4 nodes (mostly above 1 ms), roughly 30–380× the 2-node time for the same size, and the times jump erratically between neighboring sizes (on 4 nodes: 16 KB takes 295 µs while 32 KB takes 2,124 µs). This is not a bandwidth limit: the time barely depends on message size until the largest messages. Instead, individual steps are stalling. The likely difference from the 2-node case: there, each node's left and right neighbors are the same node, so the two ranks stay in lockstep. With three or more nodes, a rank can issue its two-sided SEND before its right neighbor has posted the matching RECV, which makes the sender back off and retry (RNR). Lowering `MIN_RNR_TIMER` from 12 (0.64 ms) to 1 (0.01 ms) already helped, but the remaining stalls are much longer than one RNR delay, so the cause is not fully pinned down yet. The lab machines are shared, and each size was timed only 96–506 times on these rings, so some of the noise may also come from outside the benchmark.
+
+3. **Large messages amortize the stall.** As messages grow, the fixed overhead matters less: on 3 nodes bus bandwidth climbs to **6.96 Gb/s** at 2 MB, and on 4 nodes to **5.25 Gb/s**. Both curves are still rising at the end of the sweep, so the 4 MB registered buffer, not the network, sets the limit here. Building with a larger buffer (`make MAX_BUF_SIZE=67108864`) would show where they level off.
+
+4. **Correctness held everywhere.** Every size on every ring returned the exact expected sum on all ranks, including the 3-node sizes, which are not powers of two.
