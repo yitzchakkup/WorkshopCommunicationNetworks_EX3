@@ -1,0 +1,13 @@
+Listening for LEFT neighbor on port 18515...
+Connecting to RIGHT neighbor at 10.128.128.214:18515...
+Rank 2 of 4 successfully formed the RDMA Ring!
+
+=== Node 2: BEFORE ALL-REDUCE ===
+  97   83   55   92   18   11   76   72   27   44 
+  32   11   50   64    7   32   97   77   30   60 
+=====================
+
+=== Node 2: AFTER ALL-REDUCE ===
+ 314  232  261  289  113  190  288  255  192  228 
+ 151  228  155  107  112  160  289  232  181  181 
+=====================

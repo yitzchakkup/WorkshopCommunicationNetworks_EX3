@@ -1,0 +1,29 @@
+Listening for LEFT neighbor on port 18515...
+Connecting to RIGHT neighbor at 10.128.128.212:18515...
+Rank 0 of 3 successfully formed the RDMA Ring!
+Skipping demo: 20 elements not divisible by 3 nodes.
+
+=== Ring All-Reduce benchmark: 3 nodes, TYPE_INT, OP_SUM ===
+      Size        Bytes   Elements   Iters  Avg time (us)   AlgBW Gb/s   BusBW Gb/s  Check
+---------------------------------------------------------------------------------------------
+      12 B           12          3     188         799.38        0.000        0.000     OK
+      24 B           24          6     200        2400.41        0.000        0.000     OK
+      60 B           60         15     184        2394.62        0.000        0.000     OK
+     120 B          120         30     198         730.11        0.001        0.002     OK
+     252 B          252         63     212        2367.28        0.001        0.001     OK
+     504 B          504        126     200        1972.15        0.002        0.003     OK
+    1020 B         1020        255     211         224.16        0.036        0.049     OK
+   1.99 KB         2040        510     196        2377.42        0.007        0.009     OK
+   4.00 KB         4092       1023     208        1575.98        0.021        0.028     OK
+   7.99 KB         8184       2046     207         359.66        0.182        0.243     OK
+  16.00 KB        16380       4095     199        2220.06        0.059        0.079     OK
+  31.99 KB        32760       8190     191        1547.95        0.169        0.226     OK
+  64.00 KB        65532      16383     179        2118.12        0.248        0.330     OK
+ 127.99 KB       131064      32766     199        2259.42        0.464        0.619     OK
+ 256.00 KB       262140      65535     346        1945.50        1.078        1.437     OK
+ 511.99 KB       524280     131070     169        1538.05        2.727        3.636     OK
+1024.00 KB      1048572     262143     142        2851.33        2.942        3.923     OK
+   2.00 MB      2097144     524286     113        3423.26        4.901        6.535     OK
+---------------------------------------------------------------------------------------------
+AlgBW = bits / time (Gb/s = 10^9 bits/s).  BusBW = AlgBW * 2(N-1)/N (per-link traffic of ring all-reduce).
+Results written to allreduce_results_3nodes_20261015_104109.csv
