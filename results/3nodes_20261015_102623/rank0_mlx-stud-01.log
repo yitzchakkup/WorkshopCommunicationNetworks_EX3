@@ -1,0 +1,10 @@
+Listening for LEFT neighbor on port 18515...
+Connecting to RIGHT neighbor at 10.128.128.212:18515...
+Rank 0 of 3 successfully formed the RDMA Ring!
+Skipping demo: 20 elements not divisible by 3 nodes.
+
+=== Ring All-Reduce benchmark: 3 nodes, TYPE_INT, OP_SUM ===
+      Size        Bytes   Elements   Iters  Avg time (us)   AlgBW GB/s   BusBW GB/s  Check
+---------------------------------------------------------------------------------------------
+      12 B           12          3    1000        2933.72        0.000        0.000     OK
+      24 B           24          6    1000       16214.77        0.000        0.000     OK

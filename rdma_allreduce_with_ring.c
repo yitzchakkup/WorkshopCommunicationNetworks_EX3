@@ -10,7 +10,13 @@
 #include <endian.h> // For htobe64, be64toh
 #include <time.h>   // For time-related functions (though not directly used by print_data, it was requested)
 
-#define MAX_BUF_SIZE (1024 * 1024) // 1MB buffer for All-Reduce
+// Registered RDMA buffer. Must hold the message + 2 scratch chunks + 1 sync byte,
+// so with N nodes the largest message is about MAX_BUF_SIZE * N / (N + 2).
+// Registration counts against `ulimit -l`; if the nodes allow more, raise it at
+// build time for a larger sweep: make clean && make MAX_BUF_SIZE=67108864
+#ifndef MAX_BUF_SIZE
+#define MAX_BUF_SIZE (4 * 1024 * 1024) // 4MB buffer for All-Reduce
+#endif
 
 // --- Configuration Macros ---
 #define CQ_DEPTH            200
@@ -18,7 +24,9 @@
 #define MAX_RECV_WR         100
 #define MAX_SEND_SGE        1
 #define MAX_RECV_SGE        1
-#define MIN_RNR_TIMER       12
+// RNR NAK delay a sender waits when our receive isn't posted yet. 1 = 0.01ms (12 was 0.64ms,
+// which made every 3+ node all-reduce cost tens of ms as neighbors raced ahead of each other).
+#define MIN_RNR_TIMER       1
 #define MAX_DEST_RD_ATOMIC  1
 #define MAX_RD_ATOMIC       1
 #define QP_TIMEOUT          14
@@ -802,16 +810,193 @@ int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE datatype, OP
 // -----------------------------------------------------------------------------
 // 5. Test Main
 // -----------------------------------------------------------------------------
+
+// Small 2x10 correctness demo with random data, printed on every node.
+static int run_demo(int my_rank, int num_nodes, void *handle) {
+    const int total_elements = 20;
+    const int rows = 2;
+    const int cols = 10;
+
+    if (total_elements % num_nodes != 0) {
+        if (my_rank == 0)
+            printf("Skipping demo: %d elements not divisible by %d nodes.\n", total_elements, num_nodes);
+        return 0;
+    }
+
+    int sendbuf[20], recvbuf[20];
+    srand(time(NULL) + my_rank); // Seed random number generator uniquely per node
+    for (int i = 0; i < total_elements; ++i) {
+        sendbuf[i] = rand() % 100; // Random integers between 0 and 99
+    }
+    memset(recvbuf, 0, sizeof(recvbuf));
+
+    print_data(my_rank, "BEFORE ALL-REDUCE", sendbuf, rows, cols);
+    if (pg_all_reduce(sendbuf, recvbuf, total_elements, TYPE_INT, OP_SUM, handle) != 0) {
+        fprintf(stderr, "Error: pg_all_reduce failed.\n");
+        return -1;
+    }
+    print_data(my_rank, "AFTER ALL-REDUCE", recvbuf, rows, cols);
+    return 0;
+}
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static const char *human_size(size_t bytes, char *out, size_t out_len) {
+    // Sizes with 3 nodes aren't powers of 2 (e.g. 2040 B), so show decimals when not exact
+    if (bytes >= (1 << 20))
+        snprintf(out, out_len, bytes % (1 << 20) ? "%.2f MB" : "%.0f MB", bytes / 1048576.0);
+    else if (bytes >= (1 << 10))
+        snprintf(out, out_len, bytes % (1 << 10) ? "%.2f KB" : "%.0f KB", bytes / 1024.0);
+    else
+        snprintf(out, out_len, "%zu B", bytes);
+    return out;
+}
+
+// Sweeps message sizes (powers of 2, rounded down to a multiple of num_nodes ints),
+// times pg_all_reduce at each size and verifies the result.
+// Time per size is the slowest rank's average, obtained with a MAX all-reduce.
+// Rank 0 prints a table and writes a CSV.
+static int run_benchmark(int my_rank, int num_nodes, void *handle, size_t max_bytes, const char *csv_path) {
+    // Largest message that fits in the registered buffer (see check in pg_all_reduce)
+    size_t buf_limit = (size_t)(MAX_BUF_SIZE - 1) * num_nodes / (num_nodes + 2);
+    if (max_bytes > buf_limit) max_bytes = buf_limit;
+
+    int *sendbuf = malloc(max_bytes);
+    int *recvbuf = malloc(max_bytes);
+    double *t_stat = malloc(num_nodes * sizeof(double));
+    double *t_max = malloc(num_nodes * sizeof(double));
+    int *e_stat = malloc(num_nodes * sizeof(int));
+    int *e_sum = malloc(num_nodes * sizeof(int));
+    if (!sendbuf || !recvbuf || !t_stat || !t_max || !e_stat || !e_sum) {
+        fprintf(stderr, "Error: Failed to allocate benchmark buffers.\n");
+        free(sendbuf); free(recvbuf); free(t_stat); free(t_max); free(e_stat); free(e_sum);
+        return -1;
+    }
+
+    // Deterministic input so every node can check the result locally:
+    // sendbuf[i] = rank + (i % 1000)  =>  sum = N(N-1)/2 + N * (i % 1000)
+    for (size_t i = 0; i < max_bytes / sizeof(int); i++) {
+        sendbuf[i] = my_rank + (int)(i % 1000);
+    }
+
+    FILE *csv = NULL;
+    if (my_rank == 0) {
+        csv = fopen(csv_path, "w");
+        if (!csv) {
+            perror("Error: fopen CSV");
+        } else {
+            fprintf(csv, "num_nodes,bytes,elements,iters,avg_time_us,algbw_Gbps,busbw_Gbps,errors\n");
+        }
+        printf("\n=== Ring All-Reduce benchmark: %d nodes, TYPE_INT, OP_SUM ===\n", num_nodes);
+        printf("%10s %12s %10s %7s %14s %12s %12s %6s\n",
+               "Size", "Bytes", "Elements", "Iters", "Avg time (us)", "AlgBW Gb/s", "BusBW Gb/s", "Check");
+        printf("---------------------------------------------------------------------------------------------\n");
+    }
+
+    int rc = 0;
+
+    // One-time warm-up at the largest size: pays first-touch costs (page faults, NIC address
+    // translation for the whole buffer) once, so they don't land on whichever size runs first.
+    const int global_warmup = 20;
+    int max_count = (int)(max_bytes / sizeof(int)) / num_nodes * num_nodes;
+    if (max_count == 0) max_count = num_nodes;
+    for (int w = 0; w < global_warmup; w++) {
+        if (pg_all_reduce(sendbuf, recvbuf, max_count, TYPE_INT, OP_SUM, handle) != 0) { rc = -1; goto out; }
+    }
+
+    size_t prev_bytes = 0;
+    for (size_t target = sizeof(int); target <= max_bytes; target *= 2) {
+        int count = (int)(target / sizeof(int)) / num_nodes * num_nodes;
+        if (count == 0) count = num_nodes;
+        size_t bytes = (size_t)count * sizeof(int);
+        if (bytes == prev_bytes || bytes > max_bytes) continue;
+        prev_bytes = bytes;
+
+        // Short per-size warm-up (re-syncs the ranks and settles caches for this size), then size
+        // the timed loop to ~TARGET_SEC from the slowest rank's warm-up time.
+        // All ranks must run the same number of iterations, hence the MAX all-reduce.
+        const double TARGET_SEC = 0.5;
+        const int warmup = 10;
+        const int MIN_ITERS = 100;
+        const int MAX_ITERS = 1000;
+        memset(recvbuf, 0, bytes);
+        double tw = now_sec();
+        for (int w = 0; w < warmup; w++) {
+            if (pg_all_reduce(sendbuf, recvbuf, count, TYPE_INT, OP_SUM, handle) != 0) { rc = -1; goto out; }
+        }
+        for (int i = 0; i < num_nodes; i++) t_stat[i] = (now_sec() - tw) / warmup;
+        if (pg_all_reduce(t_stat, t_max, num_nodes, TYPE_DOUBLE, OP_MAX, handle) != 0) { rc = -1; goto out; }
+        double iters_d = TARGET_SEC / t_max[0];
+        int iters = iters_d > MAX_ITERS ? MAX_ITERS : (iters_d < MIN_ITERS ? MIN_ITERS : (int)iters_d);
+
+        double t0 = now_sec();
+        for (int it = 0; it < iters; it++) {
+            if (pg_all_reduce(sendbuf, recvbuf, count, TYPE_INT, OP_SUM, handle) != 0) { rc = -1; goto out; }
+        }
+        double avg = (now_sec() - t0) / iters;
+
+        int errors = 0;
+        int base = num_nodes * (num_nodes - 1) / 2;
+        for (int i = 0; i < count; i++) {
+            if (recvbuf[i] != base + num_nodes * (i % 1000)) errors++;
+        }
+
+        // Aggregate across ranks: slowest rank's time, total error count
+        for (int i = 0; i < num_nodes; i++) { t_stat[i] = avg; e_stat[i] = errors; }
+        if (pg_all_reduce(t_stat, t_max, num_nodes, TYPE_DOUBLE, OP_MAX, handle) != 0 ||
+            pg_all_reduce(e_stat, e_sum, num_nodes, TYPE_INT, OP_SUM, handle) != 0) {
+            rc = -1;
+            goto out;
+        }
+
+        if (my_rank == 0) {
+            double t = t_max[0];
+            double algbw = bytes * 8.0 / t / 1e9; // Gbit/s
+            double busbw = algbw * 2.0 * (num_nodes - 1) / num_nodes;
+            char hs[32];
+            printf("%10s %12zu %10d %7d %14.2f %12.3f %12.3f %6s\n",
+                   human_size(bytes, hs, sizeof(hs)), bytes, count, iters,
+                   t * 1e6, algbw, busbw, e_sum[0] == 0 ? "OK" : "FAIL");
+            fflush(stdout);
+            if (csv) {
+                fprintf(csv, "%d,%zu,%d,%d,%.4f,%.6f,%.6f,%d\n",
+                        num_nodes, bytes, count, iters, t * 1e6, algbw, busbw, e_sum[0]);
+            }
+        }
+        if (e_sum[0] != 0) rc = -1;
+    }
+
+    if (my_rank == 0) {
+        printf("---------------------------------------------------------------------------------------------\n");
+        printf("AlgBW = bits / time (Gb/s = 10^9 bits/s).  BusBW = AlgBW * 2(N-1)/N (per-link traffic of ring all-reduce).\n");
+        if (csv) printf("Results written to %s\n", csv_path);
+    }
+
+out:
+    if (csv) fclose(csv);
+    free(sendbuf); free(recvbuf); free(t_stat); free(t_max); free(e_stat); free(e_sum);
+    return rc;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc < 4 || argc > 5) {
-        printf("Usage: %s <my_rank> <right_neighbor_ip> <num_nodes> [oob_port]\n", argv[0]);
+    if (argc < 4 || argc > 7) {
+        printf("Usage: %s <my_rank> <right_neighbor_ip> <num_nodes> [oob_port] [max_bytes] [csv_path]\n", argv[0]);
+        printf("  oob_port   default 18515\n");
+        printf("  max_bytes  largest message in the size sweep, default 32MB (capped by MAX_BUF_SIZE)\n");
+        printf("  csv_path   written by rank 0, default allreduce_results.csv\n");
         return 1;
     }
 
     int my_rank = atoi(argv[1]);
     char *right_ip = argv[2];
     int num_nodes = atoi(argv[3]);
-    int oob_port = (argc == 5) ? atoi(argv[4]) : 18515;
+    int oob_port = (argc >= 5) ? atoi(argv[4]) : 18515;
+    size_t max_bytes = (argc >= 6) ? strtoull(argv[5], NULL, 10) : (32UL * 1024 * 1024);
+    const char *csv_path = (argc >= 7) ? argv[6] : "allreduce_results.csv";
     void *handle = NULL;
 
     // Build the Ring
@@ -820,59 +1005,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --- All-Reduce Test Setup ---
-    srand(time(NULL) + my_rank); // Seed random number generator uniquely per node
-
-    const int total_elements = 20;
-    const int rows = 2;
-    const int cols = 10;
-
-    if (total_elements % num_nodes != 0) {
-        fprintf(stderr, "Error: Total elements (%d) must be divisible by num_nodes (%d) for this test.\n", total_elements, num_nodes);
-        pg_close(handle);
-        return 1;
-    }
-
-    int *sendbuf = (int *)malloc(total_elements * sizeof(int));
-    int *recvbuf = (int *)malloc(total_elements * sizeof(int));
-
-    if (!sendbuf || !recvbuf) {
-        fprintf(stderr, "Error: Failed to allocate sendbuf or recvbuf.\n");
-        free(sendbuf);
-        free(recvbuf);
-        pg_close(handle);
-        return 1;
-    }
-
-    // Fill sendbuf with random integers
-    for (int i = 0; i < total_elements; ++i) {
-        sendbuf[i] = rand() % 100; // Random integers between 0 and 99
-    }
-
-    // Initialize recvbuf to all zeros
-    memset(recvbuf, 0, total_elements * sizeof(int));
-
-    // Print data before the operation
-    print_data(my_rank, "BEFORE ALL-REDUCE", sendbuf, rows, cols);
-
-    // Call pg_all_reduce
-    if (pg_all_reduce(sendbuf, recvbuf, total_elements, TYPE_INT, OP_SUM, handle) != 0) {
-        fprintf(stderr, "Error: pg_all_reduce failed.\n");
-        free(sendbuf);
-        free(recvbuf);
-        pg_close(handle);
-        return 1;
-    }
-
-    // Print data after the operation
-    print_data(my_rank, "AFTER ALL-REDUCE", recvbuf, rows, cols);
-
-    // Free allocated arrays
-    free(sendbuf);
-    free(recvbuf);
-    // --- End All-Reduce Test Setup ---
+    int rc = run_demo(my_rank, num_nodes, handle);
+    if (rc == 0) rc = run_benchmark(my_rank, num_nodes, handle, max_bytes, csv_path);
 
     // Teardown
     pg_close(handle);
-    return 0;
+    return rc == 0 ? 0 : 1;
 }
