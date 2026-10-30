@@ -1,0 +1,4 @@
+ulimit_soft_kb unlimited
+ulimit_hard_kb unlimited
+uptime  13:35:43 up 45 days, 20 min, 23 users,  load average: 0.11, 0.05, 0.01
+zsh:2: no matches found: /sys/class/infiniband/*/ports/*/hw_counters/out_of_sequence

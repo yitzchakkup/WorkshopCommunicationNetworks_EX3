@@ -1,0 +1,31 @@
+num_nodes: 3
+slots: 16
+slot_size: 65536
+credit_batch: 4
+grant_window: 16
+ctrl_depth: 22
+credits_on: 1
+rnr_retry: 7
+rndv_threshold: 65536
+reg_cache: 1
+memlock_soft_kb: 0
+memlock_hard_kb: 0
+rndv_budget: 2199023254528
+rndv_cap_bytes: 33554432
+path_mtu: 4096
+max_inline: 316
+reps: 5
+mode: bw
+memcpy_segment_GBps: 18.67
+memcpy_large_GBps: 5.56
+reg_cost: bytes reg_us dereg_us
+reg_cost: 65536 53.3 16.6
+reg_cost: 131072 40.8 16.5
+reg_cost: 262144 51.3 18.4
+reg_cost: 524288 29.0 12.5
+reg_cost: 1048576 344.1 14.3
+reg_cost: 2097152 34.6 12.3
+reg_cost: 4194304 333.3 15.7
+reg_cost: 8388608 660.5 16.8
+reg_cost: 16777216 1331.7 29.8
+reg_cost: 33554432 2892.3 52.5
