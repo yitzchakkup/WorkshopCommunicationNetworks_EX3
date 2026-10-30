@@ -1,0 +1,2 @@
+gcc -Wall -Wextra -O2 -D_GNU_SOURCE -o rdma_allreduce rdma_allreduce_with_ring.c -libverbs
+gcc -Wall -O2 -D_GNU_SOURCE  -o rdma_allreduce_legacy rdma_allreduce_legacy.c -libverbs

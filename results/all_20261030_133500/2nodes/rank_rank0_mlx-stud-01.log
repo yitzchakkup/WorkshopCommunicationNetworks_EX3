@@ -1,0 +1,81 @@
+Listening for LEFT neighbor on port 18515...
+Connecting to RIGHT neighbor at 10.128.128.212:18515...
+Rank 0 of 2 successfully formed the RDMA Ring!
+Config: K=16 slots of 65536 B, credit batch 4, grant window 16, control depth 22, credits on,
+        rnr_retry 7, default protocol auto (rendezvous from 65536 B per chunk), reg cache on,
+        ulimit -l 0 KB (hard 0 KB, 0 = unlimited), rendezvous budget 2147483647 KB, path MTU 4096, inline 316 B
+
+=== Node 0: BEFORE ALL-REDUCE ===
+  84   67   40    8   18   98   74   17   25   51 
+  43   76   12    4   33    0   28   80   54   13 
+=====================
+
+=== Node 0: AFTER ALL-REDUCE (eager) ===
+ 170   91   62   47   85  186  133  114   74  128 
+ 139   78   20   42   52   80   57  179  120   22 
+=====================
+
+=== Node 0: AFTER ALL-REDUCE (rndv) ===
+ 170   91   62   47   85  186  133  114   74  128 
+ 139   78   20   42   52   80   57  179  120   22 
+=====================
+selftest eager: OK
+selftest rndv : OK
+matrix: 504 calls, 0 wrong elements: OK
+stress: 2000 calls, 0 wrong elements: OK
+tests PASSED on 2 nodes (2.8 s)
+
+=== Ring All-Reduce benchmark: 2 nodes, TYPE_INT, OP_SUM, 5 reps, bandwidth mode ===
+K=16 slots x 65536 B, credit batch 4, grant window 16, rendezvous up to 33554432 B
+Proto        Size   Elements   Iters    Min (us) Median (us)    Max (us) AlgBW Gb/s BusBW Gb/s  Check
+------------------------------------------------------------------------------------------------------
+eager         8 B          2   22457        4.42        4.43        4.44      0.014      0.014     OK
+rndv          8 B          2   12216        8.02        8.04        8.07      0.008      0.008     OK
+eager        16 B          4   20749        4.42        4.44        4.44      0.029      0.029     OK
+rndv         16 B          4   12455        8.02        8.02        8.04      0.016      0.016     OK
+eager        32 B          8   21800        4.42        4.42        4.44      0.058      0.058     OK
+rndv         32 B          8   11592        8.02        8.03        8.06      0.032      0.032     OK
+eager        64 B         16   21749        4.42        4.44        4.50      0.115      0.115     OK
+rndv         64 B         16   11993        8.14        8.15        8.22      0.063      0.063     OK
+eager       128 B         32   18701        4.93        4.94        4.94      0.207      0.207     OK
+rndv        128 B         32   11634        8.27        8.29        8.31      0.123      0.123     OK
+eager       256 B         64   18367        5.03        5.04        5.05      0.407      0.407     OK
+rndv        256 B         64   11568        8.43        8.46        8.50      0.242      0.242     OK
+eager       512 B        128   18077        5.37        5.37        5.39      0.762      0.762     OK
+rndv        512 B        128   11680        8.76        8.77        8.81      0.467      0.467     OK
+eager        1 KB        256   14820        6.61        6.61        6.62      1.239      1.239     OK
+rndv         1 KB        256   11331        9.03        9.06        9.08      0.904      0.904     OK
+eager        2 KB        512   13079        7.37        7.38        7.39      2.220      2.220     OK
+rndv         2 KB        512   10096        9.75        9.77        9.78      1.677      1.677     OK
+eager        4 KB       1024   10936        8.97        8.98        9.11      3.648      3.648     OK
+rndv         4 KB       1024    8806       11.30       11.33       11.36      2.891      2.891     OK
+eager        8 KB       2048    7582       12.11       12.12       12.17      5.409      5.409     OK
+rndv         8 KB       2048    7493       13.72       13.76       13.77      4.764      4.764     OK
+eager       16 KB       4096    6095       16.25       16.27       16.29      8.056      8.056     OK
+rndv        16 KB       4096    5078       17.75       17.78       17.90      7.373      7.373     OK
+eager       32 KB       8192    3885       25.49       25.50       25.54     10.280     10.280     OK
+rndv        32 KB       8192    3397       26.71       26.75       26.87      9.800      9.800     OK
+eager       64 KB      16384    2122       43.92       43.94       43.97     11.931     11.931     OK
+rndv        64 KB      16384    2460       41.18       41.21       41.25     12.722     12.722     OK
+eager      128 KB      32768    1145       81.89       81.98       82.17     12.791     12.791     OK
+rndv       128 KB      32768    1395       70.50       70.62       71.56     14.847     14.847     OK
+eager      256 KB      65536     779      126.60      126.79      127.41     16.541     16.541     OK
+rndv       256 KB      65536     970      102.25      102.44      102.64     20.473     20.473     OK
+eager      512 KB     131072     478      205.02      205.53      205.70     20.407     20.407     OK
+rndv       512 KB     131072     582      172.12      172.50      173.48     24.314     24.314     OK
+eager        1 MB     262144     241      411.16      411.29      411.97     20.396     20.396     OK
+rndv         1 MB     262144     297      329.45      329.47      329.83     25.461     25.461     OK
+eager        2 MB     524288     104      925.70      927.24      927.96     18.094     18.094     OK
+rndv         2 MB     524288     152      659.46      661.57      663.36     25.360     25.360     OK
+eager        4 MB    1048576      44     2214.14     2217.59     2241.81     15.131     15.131     OK
+rndv         4 MB    1048576      70     1411.78     1415.77     1416.07     23.700     23.700     OK
+eager        8 MB    2097152      19     5010.03     5028.71     5051.03     13.345     13.345     OK
+rndv         8 MB    2097152      33     2970.50     2987.25     3001.91     22.465     22.465     OK
+eager       16 MB    4194304       9     9942.81     9959.84    10014.70     13.476     13.476     OK
+rndv        16 MB    4194304      16     6175.55     6179.64     6204.57     21.719     21.719     OK
+eager       32 MB    8388608       4    20083.43    20193.29    20232.52     13.293     13.293     OK
+rndv        32 MB    8388608       7    12608.81    12630.82    12724.29     21.252     21.252     OK
+------------------------------------------------------------------------------------------------------
+Times are the slowest rank's, min/median/max over 5 repetitions. AlgBW = bits / median time (Gb/s = 10^9 bits/s).
+BusBW = AlgBW * 2(N-1)/N (per-link traffic of ring all-reduce).
+Results written to rank_2nodes_20261030_133500.csv (+ .meta.txt)
