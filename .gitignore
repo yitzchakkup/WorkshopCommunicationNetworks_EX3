@@ -5,3 +5,7 @@
 
 # build output
 rdma_allreduce
+rdma_allreduce_legacy
+sim_allreduce
+sim_results.csv*
+__pycache__/
